@@ -1,0 +1,65 @@
+# Qt / C++ build output
+build/
+build-*/
+build-debug/
+bulid-debug/
+debug/
+release/
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.a
+
+# Qt Creator user files
+*.pro.user
+*.pro.user.*
+*.qmake.stash
+Makefile
+Makefile.*
+moc_*
+ui_*
+qrc_*
+
+# Temporary / cache
+cache/
+temp/
+tmp/
+*.log
+
+# Media output files
+*.mp4
+*.flv
+*.avi
+*.mkv
+*.mov
+*.wav
+*.aac
+*.pcm
+*.yuv
+
+# Backup archives
+*.zip
+*.rar
+*.7z
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Server runtime data
+AVServer/media/
+AVServer/build/
+AVServer/log/
+AVServer/temp/
+
+# AVClient runtime cache
+AVClient/cache/
+AVClient/build*/
