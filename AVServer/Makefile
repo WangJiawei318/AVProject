@@ -1,7 +1,7 @@
 CXX := g++
 CXXFLAGS := -std=c++11 -Wall -Wextra -g -Iinclude
 TARGET := AVServer
-SOURCES := src/main.cpp src/AVServer.cpp
+SOURCES := src/main.cpp src/AVServer.cpp src/MediaManager.cpp
 
 .PHONY: all clean
 

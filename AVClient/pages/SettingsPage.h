@@ -14,7 +14,7 @@ class SettingsPage : public QWidget
     Q_OBJECT
 
 public:
-    explicit SettingsPage(QWidget *parent = nullptr);
+    explicit SettingsPage(AVNetworkClient *networkClient, QWidget *parent = nullptr);
 
 private slots:
     void slotConnectClicked();

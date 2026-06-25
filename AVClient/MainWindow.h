@@ -3,7 +3,7 @@
 
 #include <QMainWindow>
 
-class QTabWidget;
+class AVNetworkClient;
 
 class MainWindow : public QMainWindow
 {
@@ -11,6 +11,9 @@ class MainWindow : public QMainWindow
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
+
+private:
+    AVNetworkClient *m_networkClient;
 };
 
 #endif // MAINWINDOW_H

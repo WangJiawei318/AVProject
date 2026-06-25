@@ -23,6 +23,11 @@ AVServer::~AVServer()
 bool AVServer::start(uint16_t port)
 {
     printf("server started\n");
+    if (!m_mediaManager.ensureMediaDir()) {
+        printf("failed to create or open media directory: %s\n", m_mediaManager.mediaDir().c_str());
+        return false;
+    }
+    printf("media directory: %s\n", m_mediaManager.mediaDir().c_str());
 
     m_listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if (m_listenFd < 0) {
@@ -153,10 +158,41 @@ void AVServer::handlePacket(int clientFd, const std::vector<char> &packet)
         printf("sent LOGIN_RS\n");
         break;
     }
+    case DEF_PACK_MEDIA_LIST_RQ:
+    {
+        printf("received MEDIA_LIST_RQ\n");
+        sendMediaList(clientFd);
+        break;
+    }
     default:
         printf("received unknown packet type: %d\n", type);
         break;
     }
+}
+
+void AVServer::sendMediaList(int clientFd)
+{
+    printf("scan media directory\n");
+    int mediaCount = 0;
+    std::string payload = m_mediaManager.buildMediaListPayload(&mediaCount);
+    printf("media count: %d\n", mediaCount);
+
+    const int maxPayload = 1024 * 1024 - static_cast<int>(sizeof(STRU_MEDIA_LIST_RS_HEADER));
+    if (static_cast<int>(payload.size()) > maxPayload) {
+        payload.resize(maxPayload);
+        printf("media list payload truncated to %d bytes\n", maxPayload);
+    }
+
+    STRU_MEDIA_LIST_RS_HEADER header;
+    header.payloadSize = static_cast<int32_t>(payload.size());
+
+    std::vector<char> packet(sizeof(header) + payload.size());
+    memcpy(packet.data(), &header, sizeof(header));
+    if (!payload.empty())
+        memcpy(packet.data() + sizeof(header), payload.data(), payload.size());
+
+    sendPacket(clientFd, packet.data(), static_cast<int>(packet.size()));
+    printf("sent MEDIA_LIST_RS\n");
 }
 
 void AVServer::closeListenFd()

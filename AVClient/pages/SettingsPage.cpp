@@ -11,9 +11,9 @@
 #include <QTime>
 #include <QVBoxLayout>
 
-SettingsPage::SettingsPage(QWidget *parent)
+SettingsPage::SettingsPage(AVNetworkClient *networkClient, QWidget *parent)
     : QWidget(parent),
-      m_networkClient(new AVNetworkClient(this))
+      m_networkClient(networkClient)
 {
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(24, 24, 24, 24);
@@ -69,6 +69,7 @@ SettingsPage::SettingsPage(QWidget *parent)
     connect(m_networkClient, SIGNAL(pingResponse(QString)), this, SLOT(slotPingResponse(QString)));
 
     appendLog("network test page ready");
+    slotConnectedChanged(m_networkClient->isConnected());
 }
 
 void SettingsPage::slotConnectClicked()

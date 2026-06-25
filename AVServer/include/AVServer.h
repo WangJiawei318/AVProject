@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <vector>
 
+#include "MediaManager.h"
+
 class AVServer
 {
 public:
@@ -17,10 +19,12 @@ private:
     bool sendPacket(int fd, const char *data, int len);
     void handleClient(int clientFd);
     void handlePacket(int clientFd, const std::vector<char> &packet);
+    void sendMediaList(int clientFd);
     void closeListenFd();
 
 private:
     int m_listenFd;
+    MediaManager m_mediaManager;
 };
 
 #endif // AVSERVER_H

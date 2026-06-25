@@ -18,6 +18,7 @@ public:
     void disconnectFromServer();
     bool sendPing();
     bool sendLogin(const QString &username, const QString &password);
+    bool sendMediaListRequest();
     bool isConnected() const;
 
 signals:
@@ -25,6 +26,7 @@ signals:
     void logMessage(const QString &message);
     void pingResponse(const QString &message);
     void loginResponse(bool success, const QString &message);
+    void mediaListReceived(const QString &payload);
 
 private slots:
     void onConnected();

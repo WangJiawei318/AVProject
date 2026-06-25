@@ -16,6 +16,7 @@ SOURCES += \
     MainWindow.cpp \
     pages/PlayerPage.cpp \
     pages/RecorderPage.cpp \
+    pages/RemoteMediaPage.cpp \
     pages/SettingsPage.cpp \
     modules/network/AVNetworkClient.cpp \
     modules/network/TcpClient.cpp \
@@ -33,6 +34,7 @@ HEADERS += \
     MainWindow.h \
     pages/PlayerPage.h \
     pages/RecorderPage.h \
+    pages/RemoteMediaPage.h \
     pages/SettingsPage.h \
     modules/network/AVNetworkClient.h \
     modules/network/TcpClient.h \

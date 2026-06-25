@@ -53,6 +53,14 @@ bool AVNetworkClient::sendLogin(const QString &username, const QString &password
     return ok;
 }
 
+bool AVNetworkClient::sendMediaListRequest()
+{
+    STRU_MEDIA_LIST_RQ rq;
+    bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
+    emit logMessage(ok ? "sent MEDIA_LIST_RQ" : "failed to send MEDIA_LIST_RQ");
+    return ok;
+}
+
 bool AVNetworkClient::isConnected() const
 {
     return m_tcpClient->isConnected();
@@ -109,6 +117,26 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         QString message = QString::fromLocal8Bit(rs->message);
         emit logMessage(QString("received LOGIN_RS: %1").arg(message));
         emit loginResponse(rs->result != 0, message);
+        break;
+    }
+    case DEF_PACK_MEDIA_LIST_RS:
+    {
+        if (packet.size() < static_cast<int>(sizeof(STRU_MEDIA_LIST_RS_HEADER))) {
+            emit logMessage("received short MEDIA_LIST_RS");
+            return;
+        }
+        const STRU_MEDIA_LIST_RS_HEADER *header =
+                reinterpret_cast<const STRU_MEDIA_LIST_RS_HEADER *>(packet.constData());
+        if (header->payloadSize < 0 ||
+                packet.size() < static_cast<int>(sizeof(STRU_MEDIA_LIST_RS_HEADER) + header->payloadSize)) {
+            emit logMessage("received invalid MEDIA_LIST_RS payload");
+            return;
+        }
+
+        QByteArray payload = packet.mid(sizeof(STRU_MEDIA_LIST_RS_HEADER), header->payloadSize);
+        QString text = QString::fromUtf8(payload);
+        emit logMessage(QString("received MEDIA_LIST_RS: %1 bytes").arg(header->payloadSize));
+        emit mediaListReceived(text);
         break;
     }
     default:
