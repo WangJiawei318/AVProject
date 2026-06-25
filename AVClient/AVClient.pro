@@ -1,4 +1,4 @@
-QT += core gui widgets multimedia opengl
+QT += core gui widgets multimedia opengl network
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -17,6 +17,8 @@ SOURCES += \
     pages/PlayerPage.cpp \
     pages/RecorderPage.cpp \
     pages/SettingsPage.cpp \
+    modules/network/AVNetworkClient.cpp \
+    modules/network/TcpClient.cpp \
     modules/player/PacketQueue.cpp \
     modules/player/myopenglwidget.cpp \
     modules/player/playerdialog.cpp \
@@ -32,6 +34,9 @@ HEADERS += \
     pages/PlayerPage.h \
     pages/RecorderPage.h \
     pages/SettingsPage.h \
+    modules/network/AVNetworkClient.h \
+    modules/network/TcpClient.h \
+    modules/network/av_protocol.h \
     modules/player/PacketQueue.h \
     modules/player/myopenglwidget.h \
     modules/player/playerdialog.h \
@@ -50,6 +55,7 @@ FORMS += \
 
 INCLUDEPATH += \
     $$PWD/pages \
+    $$PWD/modules/network \
     $$PWD/modules/player \
     $$PWD/modules/recorder \
     $$PWD/../MediaPlayer/ffmpeg-4.2.2/include \
@@ -58,6 +64,7 @@ INCLUDEPATH += \
     $$PWD/../VideoRecorder/opencv-release/include
 
 LIBS += \
+    -lws2_32 \
     -lopengl32 \
     $$PWD/../MediaPlayer/ffmpeg-4.2.2/lib/avcodec.lib \
     $$PWD/../MediaPlayer/ffmpeg-4.2.2/lib/avdevice.lib \

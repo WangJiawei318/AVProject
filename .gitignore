@@ -22,6 +22,7 @@ release/
 *.qmake.stash
 Makefile
 Makefile.*
+!AVServer/Makefile
 moc_*
 ui_*
 qrc_*
@@ -63,3 +64,4 @@ AVServer/temp/
 # AVClient runtime cache
 AVClient/cache/
 AVClient/build*/
+AVClient/bin/
