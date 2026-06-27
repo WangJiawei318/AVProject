@@ -12,6 +12,9 @@ class PlayerPage : public QWidget
 public:
     explicit PlayerPage(QWidget *parent = nullptr);
 
+public slots:
+    void playLocalFile(const QString &filePath);
+
 private:
     PlayerDialog *m_playerDialog;
 };

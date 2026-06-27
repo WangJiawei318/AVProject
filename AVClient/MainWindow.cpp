@@ -10,15 +10,28 @@
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent),
-      m_networkClient(new AVNetworkClient(this))
+      m_networkClient(new AVNetworkClient(this)),
+      m_tabs(new QTabWidget(this)),
+      m_playerPage(new PlayerPage(m_tabs))
 {
-    auto *tabs = new QTabWidget(this);
-    tabs->addTab(new PlayerPage(tabs), "Player");
-    tabs->addTab(new RecorderPage(tabs), "Recorder");
-    tabs->addTab(new RemoteMediaPage(m_networkClient, tabs), "Remote Media");
-    tabs->addTab(new SettingsPage(m_networkClient, tabs), "Settings");
+    auto *remoteMediaPage = new RemoteMediaPage(m_networkClient, m_tabs);
+    m_tabs->addTab(m_playerPage, "Player");
+    m_tabs->addTab(new RecorderPage(m_tabs), "Recorder");
+    m_tabs->addTab(remoteMediaPage, "Remote Media");
+    m_tabs->addTab(new SettingsPage(m_networkClient, m_tabs), "Settings");
 
-    setCentralWidget(tabs);
+    connect(remoteMediaPage,
+            SIGNAL(requestPlayLocalFile(QString)),
+            this,
+            SLOT(slotPlayLocalFile(QString)));
+
+    setCentralWidget(m_tabs);
     setWindowTitle("AVClient");
     resize(1180, 760);
+}
+
+void MainWindow::slotPlayLocalFile(const QString &filePath)
+{
+    m_tabs->setCurrentWidget(m_playerPage);
+    m_playerPage->playLocalFile(filePath);
 }

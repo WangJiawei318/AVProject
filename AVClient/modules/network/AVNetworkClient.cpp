@@ -143,6 +143,56 @@ bool AVNetworkClient::sendUploadFinish(const QString &uploadId,
     return ok;
 }
 
+bool AVNetworkClient::sendDownloadInit(const QString &fileName)
+{
+    STRU_DOWNLOAD_INIT_RQ rq;
+    if (!copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
+        emit logMessage("failed to send DOWNLOAD_INIT_RQ: file name is too long");
+        return false;
+    }
+
+    const bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
+    emit logMessage(ok ? "sent DOWNLOAD_INIT_RQ" : "failed to send DOWNLOAD_INIT_RQ");
+    return ok;
+}
+
+bool AVNetworkClient::sendDownloadBlock(const QString &fileName,
+                                        qint64 offset,
+                                        int requestSize)
+{
+    if (requestSize <= 0 || requestSize > AV_UPLOAD_BLOCK_SIZE) {
+        emit logMessage("failed to send DOWNLOAD_BLOCK_RQ: invalid block size");
+        return false;
+    }
+
+    STRU_DOWNLOAD_BLOCK_RQ rq;
+    if (!copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
+        emit logMessage("failed to send DOWNLOAD_BLOCK_RQ: file name is too long");
+        return false;
+    }
+    rq.offset = offset;
+    rq.requestSize = requestSize;
+
+    const bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
+    if (!ok)
+        emit logMessage("failed to send DOWNLOAD_BLOCK_RQ");
+    return ok;
+}
+
+bool AVNetworkClient::sendDownloadFinish(const QString &fileName, qint64 fileSize)
+{
+    STRU_DOWNLOAD_FINISH_RQ rq;
+    if (!copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
+        emit logMessage("failed to send DOWNLOAD_FINISH_RQ: file name is too long");
+        return false;
+    }
+    rq.fileSize = fileSize;
+
+    const bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
+    emit logMessage(ok ? "sent DOWNLOAD_FINISH_RQ" : "failed to send DOWNLOAD_FINISH_RQ");
+    return ok;
+}
+
 bool AVNetworkClient::isConnected() const
 {
     return m_tcpClient->isConnected();
@@ -263,6 +313,76 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         emit logMessage(QString("received UPLOAD_FINISH_RS: %1").arg(message));
         emit uploadFinishResponse(rs.result != 0, fileName, message);
+        break;
+    }
+    case DEF_PACK_DOWNLOAD_INIT_RS:
+    {
+        if (packet.size() != static_cast<int>(sizeof(STRU_DOWNLOAD_INIT_RS))) {
+            emit logMessage("received invalid DOWNLOAD_INIT_RS");
+            emit downloadInitResponse(false,
+                                      QString(),
+                                      0,
+                                      "invalid DOWNLOAD_INIT_RS");
+            return;
+        }
+        STRU_DOWNLOAD_INIT_RS rs;
+        memcpy(&rs, packet.constData(), sizeof(rs));
+        const QString fileName = utf8Field(rs.fileName, sizeof(rs.fileName));
+        const QString message = utf8Field(rs.message, sizeof(rs.message));
+        emit logMessage(QString("received DOWNLOAD_INIT_RS: %1").arg(message));
+        emit downloadInitResponse(rs.result != 0, fileName, rs.fileSize, message);
+        break;
+    }
+    case DEF_PACK_DOWNLOAD_BLOCK_RS:
+    {
+        if (packet.size() < static_cast<int>(sizeof(STRU_DOWNLOAD_BLOCK_RS_HEADER))) {
+            emit logMessage("received short DOWNLOAD_BLOCK_RS");
+            emit downloadBlockResponse(false,
+                                       QString(),
+                                       0,
+                                       QByteArray(),
+                                       "short DOWNLOAD_BLOCK_RS");
+            return;
+        }
+        STRU_DOWNLOAD_BLOCK_RS_HEADER rs;
+        memcpy(&rs, packet.constData(), sizeof(rs));
+        if (rs.dataSize < 0 ||
+                rs.dataSize > AV_UPLOAD_BLOCK_SIZE ||
+                packet.size() != static_cast<int>(sizeof(rs) + rs.dataSize)) {
+            emit logMessage("received invalid DOWNLOAD_BLOCK_RS payload");
+            emit downloadBlockResponse(false,
+                                       QString(),
+                                       rs.offset,
+                                       QByteArray(),
+                                       "invalid DOWNLOAD_BLOCK_RS payload");
+            return;
+        }
+
+        const QString fileName = utf8Field(rs.fileName, sizeof(rs.fileName));
+        const QString message = utf8Field(rs.message, sizeof(rs.message));
+        const QByteArray data = packet.mid(sizeof(rs), rs.dataSize);
+        emit downloadBlockResponse(rs.result != 0,
+                                   fileName,
+                                   rs.offset,
+                                   data,
+                                   message);
+        break;
+    }
+    case DEF_PACK_DOWNLOAD_FINISH_RS:
+    {
+        if (packet.size() != static_cast<int>(sizeof(STRU_DOWNLOAD_FINISH_RS))) {
+            emit logMessage("received invalid DOWNLOAD_FINISH_RS");
+            emit downloadFinishResponse(false,
+                                         QString(),
+                                         "invalid DOWNLOAD_FINISH_RS");
+            return;
+        }
+        STRU_DOWNLOAD_FINISH_RS rs;
+        memcpy(&rs, packet.constData(), sizeof(rs));
+        const QString fileName = utf8Field(rs.fileName, sizeof(rs.fileName));
+        const QString message = utf8Field(rs.message, sizeof(rs.message));
+        emit logMessage(QString("received DOWNLOAD_FINISH_RS: %1").arg(message));
+        emit downloadFinishResponse(rs.result != 0, fileName, message);
         break;
     }
     default:

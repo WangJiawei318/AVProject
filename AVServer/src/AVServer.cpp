@@ -197,6 +197,15 @@ void AVServer::handlePacket(int clientFd, const std::vector<char> &packet)
     case DEF_PACK_UPLOAD_FINISH_RQ:
         handleUploadFinish(clientFd, packet);
         break;
+    case DEF_PACK_DOWNLOAD_INIT_RQ:
+        handleDownloadInit(clientFd, packet);
+        break;
+    case DEF_PACK_DOWNLOAD_BLOCK_RQ:
+        handleDownloadBlock(clientFd, packet);
+        break;
+    case DEF_PACK_DOWNLOAD_FINISH_RQ:
+        handleDownloadFinish(clientFd, packet);
+        break;
     default:
         printf("received unknown packet type: %d\n", type);
         break;
@@ -307,6 +316,103 @@ void AVServer::handleUploadFinish(int clientFd, const std::vector<char> &packet)
     } else {
         printf("upload finish rejected: %s\n", message.c_str());
     }
+}
+
+void AVServer::handleDownloadInit(int clientFd, const std::vector<char> &packet)
+{
+    STRU_DOWNLOAD_INIT_RS rs;
+    if (packet.size() != sizeof(STRU_DOWNLOAD_INIT_RQ)) {
+        copyText(rs.message, sizeof(rs.message), "invalid DOWNLOAD_INIT_RQ size");
+        sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+        return;
+    }
+
+    STRU_DOWNLOAD_INIT_RQ rq;
+    memcpy(&rq, packet.data(), sizeof(rq));
+    const std::string fileName = boundedString(rq.fileName, sizeof(rq.fileName));
+    printf("received DOWNLOAD_INIT_RQ filename=%s\n", fileName.c_str());
+
+    std::string message;
+    rs.result = m_downloadManager.getFileInfo(fileName,
+                                              &rs.fileSize,
+                                              &message) ? 1 : 0;
+    copyText(rs.fileName, sizeof(rs.fileName), fileName);
+    copyText(rs.message, sizeof(rs.message), message);
+    sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+
+    if (rs.result)
+        printf("download init ok file_size=%lld\n", static_cast<long long>(rs.fileSize));
+    else
+        printf("download init rejected: %s\n", message.c_str());
+}
+
+void AVServer::handleDownloadBlock(int clientFd, const std::vector<char> &packet)
+{
+    STRU_DOWNLOAD_BLOCK_RS_HEADER rs;
+    if (packet.size() != sizeof(STRU_DOWNLOAD_BLOCK_RQ)) {
+        copyText(rs.message, sizeof(rs.message), "invalid DOWNLOAD_BLOCK_RQ size");
+        sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+        return;
+    }
+
+    STRU_DOWNLOAD_BLOCK_RQ rq;
+    memcpy(&rq, packet.data(), sizeof(rq));
+    const std::string fileName = boundedString(rq.fileName, sizeof(rq.fileName));
+    copyText(rs.fileName, sizeof(rs.fileName), fileName);
+    rs.offset = rq.offset;
+
+    printf("received DOWNLOAD_BLOCK_RQ offset=%lld size=%d\n",
+           static_cast<long long>(rq.offset), rq.requestSize);
+
+    std::vector<char> data;
+    std::string message;
+    rs.result = m_downloadManager.readBlock(fileName,
+                                            rq.offset,
+                                            rq.requestSize,
+                                            &data,
+                                            &message) ? 1 : 0;
+    rs.dataSize = rs.result ? static_cast<int32_t>(data.size()) : 0;
+    copyText(rs.message, sizeof(rs.message), message);
+
+    std::vector<char> response(sizeof(rs) + data.size());
+    memcpy(response.data(), &rs, sizeof(rs));
+    if (!data.empty())
+        memcpy(response.data() + sizeof(rs), data.data(), data.size());
+    sendPacket(clientFd, response.data(), static_cast<int>(response.size()));
+
+    if (rs.result) {
+        printf("sent DOWNLOAD_BLOCK_RS offset=%lld size=%d\n",
+               static_cast<long long>(rs.offset), rs.dataSize);
+    } else {
+        printf("download block rejected: %s\n", message.c_str());
+    }
+}
+
+void AVServer::handleDownloadFinish(int clientFd, const std::vector<char> &packet)
+{
+    printf("received DOWNLOAD_FINISH_RQ\n");
+    STRU_DOWNLOAD_FINISH_RS rs;
+    if (packet.size() != sizeof(STRU_DOWNLOAD_FINISH_RQ)) {
+        copyText(rs.message, sizeof(rs.message), "invalid DOWNLOAD_FINISH_RQ size");
+        sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+        return;
+    }
+
+    STRU_DOWNLOAD_FINISH_RQ rq;
+    memcpy(&rq, packet.data(), sizeof(rq));
+    const std::string fileName = boundedString(rq.fileName, sizeof(rq.fileName));
+    std::string message;
+    rs.result = m_downloadManager.validateCompletion(fileName,
+                                                     rq.fileSize,
+                                                     &message) ? 1 : 0;
+    copyText(rs.fileName, sizeof(rs.fileName), fileName);
+    copyText(rs.message, sizeof(rs.message), message);
+    sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+
+    if (rs.result)
+        printf("download finished filename=%s\n", fileName.c_str());
+    else
+        printf("download finish rejected: %s\n", message.c_str());
 }
 
 void AVServer::sendMediaList(int clientFd)

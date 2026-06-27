@@ -17,3 +17,8 @@ PlayerPage::PlayerPage(QWidget *parent)
     layout->addWidget(m_playerDialog);
     m_playerDialog->show();
 }
+
+void PlayerPage::playLocalFile(const QString &filePath)
+{
+    m_playerDialog->playLocalFile(filePath);
+}

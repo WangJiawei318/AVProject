@@ -29,6 +29,11 @@ public:
     bool sendUploadFinish(const QString &uploadId,
                           const QString &fileName,
                           qint64 fileSize);
+    bool sendDownloadInit(const QString &fileName);
+    bool sendDownloadBlock(const QString &fileName,
+                           qint64 offset,
+                           int requestSize);
+    bool sendDownloadFinish(const QString &fileName, qint64 fileSize);
     bool isConnected() const;
 
 signals:
@@ -47,6 +52,18 @@ signals:
     void uploadFinishResponse(bool success,
                               const QString &fileName,
                               const QString &message);
+    void downloadInitResponse(bool success,
+                              const QString &fileName,
+                              qint64 fileSize,
+                              const QString &message);
+    void downloadBlockResponse(bool success,
+                               const QString &fileName,
+                               qint64 offset,
+                               const QByteArray &data,
+                               const QString &message);
+    void downloadFinishResponse(bool success,
+                                const QString &fileName,
+                                const QString &message);
 
 private slots:
     void onConnected();

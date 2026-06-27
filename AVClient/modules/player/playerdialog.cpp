@@ -186,10 +186,6 @@ void PlayerDialog::setButtonsForState(PlayerState state)
  */
 void PlayerDialog::on_pb_start_clicked()
 {
-    // 打开新文件前，必须先停止旧的播放任务，否则旧的读线程/SDL 回调还会继续访问资源。
-    if (m_player->playerState() != PlayerState::Stop)
-        m_player->stop(true);
-
     //打开浏览选择文件
     QString path = QFileDialog::getOpenFileName(this,
                                                 "选择要播放的文件",
@@ -198,15 +194,23 @@ void PlayerDialog::on_pb_start_clicked()
     if (path.isEmpty())
         return;
 
-    QFileInfo info(path);
-    if (!info.exists())
-    {
+    playLocalFile(path);
+}
+
+void PlayerDialog::playLocalFile(const QString &filePath)
+{
+    QFileInfo info(filePath);
+    if (!info.exists() || !info.isFile()) {
         QMessageBox::information(this, "提示", "打开文件失败");
         return;
     }
 
+    // 打开新文件前，必须先停止旧的播放任务，否则旧的读线程/SDL 回调还会继续访问资源。
+    if (m_player->playerState() != PlayerState::Stop)
+        m_player->stop(true);
+
     ui->lb_videoName->setText(info.fileName());
-    m_player->setFileName(path);
+    m_player->setFileName(info.absoluteFilePath());
 
     //m_player->setFileName(_DEF_PATH);
     //m_player->setFileName(_DEF_LIVE_PATH);

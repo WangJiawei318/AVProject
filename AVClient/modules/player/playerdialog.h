@@ -34,6 +34,9 @@ public:
     explicit PlayerDialog(QWidget *parent = nullptr);
     ~PlayerDialog() override;
 
+public slots:
+    void playLocalFile(const QString &filePath);
+
 protected:
     // 不单独新增 VideoSlider 子类时，用事件过滤器拦截进度条鼠标点击，
     // 实现“点击进度条任意位置即可跳转”的效果。
