@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "MediaManager.h"
+#include "UploadManager.h"
 
 class AVServer
 {
@@ -20,11 +21,15 @@ private:
     void handleClient(int clientFd);
     void handlePacket(int clientFd, const std::vector<char> &packet);
     void sendMediaList(int clientFd);
+    void handleUploadInit(int clientFd, const std::vector<char> &packet);
+    void handleUploadBlock(int clientFd, const std::vector<char> &packet);
+    void handleUploadFinish(int clientFd, const std::vector<char> &packet);
     void closeListenFd();
 
 private:
     int m_listenFd;
     MediaManager m_mediaManager;
+    UploadManager m_uploadManager;
 };
 
 #endif // AVSERVER_H

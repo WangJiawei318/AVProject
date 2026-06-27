@@ -2,6 +2,7 @@
 #define AVNETWORKCLIENT_H
 
 #include <QObject>
+#include <QByteArray>
 #include <QString>
 
 #include "TcpClient.h"
@@ -19,6 +20,15 @@ public:
     bool sendPing();
     bool sendLogin(const QString &username, const QString &password);
     bool sendMediaListRequest();
+    bool sendUploadInit(const QString &fileName,
+                        const QString &extension,
+                        qint64 fileSize);
+    bool sendUploadBlock(const QString &uploadId,
+                         qint64 offset,
+                         const QByteArray &data);
+    bool sendUploadFinish(const QString &uploadId,
+                          const QString &fileName,
+                          qint64 fileSize);
     bool isConnected() const;
 
 signals:
@@ -27,6 +37,16 @@ signals:
     void pingResponse(const QString &message);
     void loginResponse(bool success, const QString &message);
     void mediaListReceived(const QString &payload);
+    void uploadInitResponse(bool success,
+                            const QString &uploadId,
+                            const QString &message);
+    void uploadBlockResponse(bool success,
+                             const QString &uploadId,
+                             qint64 receivedOffset,
+                             const QString &message);
+    void uploadFinishResponse(bool success,
+                              const QString &fileName,
+                              const QString &message);
 
 private slots:
     void onConnected();

@@ -11,9 +11,19 @@ static const int32_t DEF_PACK_LOGIN_RQ = DEF_PACK_BASE + 3;
 static const int32_t DEF_PACK_LOGIN_RS = DEF_PACK_BASE + 4;
 static const int32_t DEF_PACK_MEDIA_LIST_RQ = DEF_PACK_BASE + 5;
 static const int32_t DEF_PACK_MEDIA_LIST_RS = DEF_PACK_BASE + 6;
+static const int32_t DEF_PACK_UPLOAD_INIT_RQ = DEF_PACK_BASE + 7;
+static const int32_t DEF_PACK_UPLOAD_INIT_RS = DEF_PACK_BASE + 8;
+static const int32_t DEF_PACK_UPLOAD_BLOCK_RQ = DEF_PACK_BASE + 9;
+static const int32_t DEF_PACK_UPLOAD_BLOCK_RS = DEF_PACK_BASE + 10;
+static const int32_t DEF_PACK_UPLOAD_FINISH_RQ = DEF_PACK_BASE + 11;
+static const int32_t DEF_PACK_UPLOAD_FINISH_RS = DEF_PACK_BASE + 12;
 
 static const int AV_NAME_SIZE = 32;
 static const int AV_TEXT_SIZE = 128;
+static const int AV_FILE_NAME_SIZE = 256;
+static const int AV_EXTENSION_SIZE = 16;
+static const int AV_UPLOAD_ID_SIZE = 64;
+static const int AV_UPLOAD_BLOCK_SIZE = 64 * 1024;
 
 typedef int32_t PackType;
 
@@ -94,6 +104,104 @@ struct STRU_MEDIA_LIST_RS_HEADER
 
     PackType type;
     int32_t payloadSize;
+};
+
+struct STRU_UPLOAD_INIT_RQ
+{
+    STRU_UPLOAD_INIT_RQ()
+        : type(DEF_PACK_UPLOAD_INIT_RQ),
+          fileSize(0)
+    {
+        memset(fileName, 0, sizeof(fileName));
+        memset(extension, 0, sizeof(extension));
+    }
+
+    PackType type;
+    int64_t fileSize;
+    char fileName[AV_FILE_NAME_SIZE];
+    char extension[AV_EXTENSION_SIZE];
+};
+
+struct STRU_UPLOAD_INIT_RS
+{
+    STRU_UPLOAD_INIT_RS()
+        : type(DEF_PACK_UPLOAD_INIT_RS),
+          result(0)
+    {
+        memset(uploadId, 0, sizeof(uploadId));
+        memset(message, 0, sizeof(message));
+    }
+
+    PackType type;
+    int32_t result;
+    char uploadId[AV_UPLOAD_ID_SIZE];
+    char message[AV_TEXT_SIZE];
+};
+
+struct STRU_UPLOAD_BLOCK_RQ_HEADER
+{
+    STRU_UPLOAD_BLOCK_RQ_HEADER()
+        : type(DEF_PACK_UPLOAD_BLOCK_RQ),
+          offset(0),
+          dataSize(0)
+    {
+        memset(uploadId, 0, sizeof(uploadId));
+    }
+
+    PackType type;
+    char uploadId[AV_UPLOAD_ID_SIZE];
+    int64_t offset;
+    int32_t dataSize;
+};
+
+struct STRU_UPLOAD_BLOCK_RS
+{
+    STRU_UPLOAD_BLOCK_RS()
+        : type(DEF_PACK_UPLOAD_BLOCK_RS),
+          result(0),
+          receivedOffset(0)
+    {
+        memset(uploadId, 0, sizeof(uploadId));
+        memset(message, 0, sizeof(message));
+    }
+
+    PackType type;
+    int32_t result;
+    char uploadId[AV_UPLOAD_ID_SIZE];
+    int64_t receivedOffset;
+    char message[AV_TEXT_SIZE];
+};
+
+struct STRU_UPLOAD_FINISH_RQ
+{
+    STRU_UPLOAD_FINISH_RQ()
+        : type(DEF_PACK_UPLOAD_FINISH_RQ),
+          fileSize(0)
+    {
+        memset(uploadId, 0, sizeof(uploadId));
+        memset(fileName, 0, sizeof(fileName));
+    }
+
+    PackType type;
+    char uploadId[AV_UPLOAD_ID_SIZE];
+    char fileName[AV_FILE_NAME_SIZE];
+    int64_t fileSize;
+};
+
+struct STRU_UPLOAD_FINISH_RS
+{
+    STRU_UPLOAD_FINISH_RS()
+        : type(DEF_PACK_UPLOAD_FINISH_RS),
+          result(0)
+    {
+        memset(fileName, 0, sizeof(fileName));
+        memset(message, 0, sizeof(message));
+    }
+
+    PackType type;
+    int32_t result;
+    char fileName[AV_FILE_NAME_SIZE];
+    char message[AV_TEXT_SIZE];
 };
 
 #pragma pack(pop)

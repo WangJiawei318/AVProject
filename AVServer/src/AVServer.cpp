@@ -10,6 +10,23 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+namespace {
+
+std::string boundedString(const char *value, size_t capacity)
+{
+    return std::string(value, strnlen(value, capacity));
+}
+
+void copyText(char *target, size_t capacity, const std::string &value)
+{
+    if (capacity == 0)
+        return;
+    strncpy(target, value.c_str(), capacity - 1);
+    target[capacity - 1] = '\0';
+}
+
+} // namespace
+
 AVServer::AVServer()
     : m_listenFd(-1)
 {
@@ -28,6 +45,12 @@ bool AVServer::start(uint16_t port)
         return false;
     }
     printf("media directory: %s\n", m_mediaManager.mediaDir().c_str());
+    if (!m_uploadManager.ensureDirectories()) {
+        printf("failed to create or open upload directory: %s\n",
+               m_uploadManager.tempDir().c_str());
+        return false;
+    }
+    printf("upload temp directory: %s\n", m_uploadManager.tempDir().c_str());
 
     m_listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if (m_listenFd < 0) {
@@ -75,6 +98,7 @@ bool AVServer::start(uint16_t port)
                static_cast<unsigned>(ntohs(clientAddr.sin_port)));
 
         handleClient(clientFd);
+        m_uploadManager.abortAll();
         close(clientFd);
         printf("client disconnected\n");
     }
@@ -164,9 +188,124 @@ void AVServer::handlePacket(int clientFd, const std::vector<char> &packet)
         sendMediaList(clientFd);
         break;
     }
+    case DEF_PACK_UPLOAD_INIT_RQ:
+        handleUploadInit(clientFd, packet);
+        break;
+    case DEF_PACK_UPLOAD_BLOCK_RQ:
+        handleUploadBlock(clientFd, packet);
+        break;
+    case DEF_PACK_UPLOAD_FINISH_RQ:
+        handleUploadFinish(clientFd, packet);
+        break;
     default:
         printf("received unknown packet type: %d\n", type);
         break;
+    }
+}
+
+void AVServer::handleUploadInit(int clientFd, const std::vector<char> &packet)
+{
+    printf("received UPLOAD_INIT_RQ\n");
+    STRU_UPLOAD_INIT_RS rs;
+    if (packet.size() != sizeof(STRU_UPLOAD_INIT_RQ)) {
+        copyText(rs.message, sizeof(rs.message), "invalid UPLOAD_INIT_RQ size");
+        sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+        return;
+    }
+
+    STRU_UPLOAD_INIT_RQ rq;
+    memcpy(&rq, packet.data(), sizeof(rq));
+    const std::string fileName = boundedString(rq.fileName, sizeof(rq.fileName));
+    const std::string extension = boundedString(rq.extension, sizeof(rq.extension));
+    std::string uploadId;
+    std::string message;
+
+    rs.result = m_uploadManager.createUpload(fileName,
+                                             extension,
+                                             rq.fileSize,
+                                             &uploadId,
+                                             &message) ? 1 : 0;
+    copyText(rs.uploadId, sizeof(rs.uploadId), uploadId);
+    copyText(rs.message, sizeof(rs.message), message);
+    sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+
+    if (rs.result)
+        printf("upload_id created: %s file=%s size=%lld\n",
+               uploadId.c_str(), fileName.c_str(), static_cast<long long>(rq.fileSize));
+    else
+        printf("upload init rejected: %s\n", message.c_str());
+}
+
+void AVServer::handleUploadBlock(int clientFd, const std::vector<char> &packet)
+{
+    STRU_UPLOAD_BLOCK_RS rs;
+    if (packet.size() < sizeof(STRU_UPLOAD_BLOCK_RQ_HEADER)) {
+        copyText(rs.message, sizeof(rs.message), "invalid UPLOAD_BLOCK_RQ size");
+        sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+        return;
+    }
+
+    STRU_UPLOAD_BLOCK_RQ_HEADER header;
+    memcpy(&header, packet.data(), sizeof(header));
+    const std::string uploadId = boundedString(header.uploadId, sizeof(header.uploadId));
+    copyText(rs.uploadId, sizeof(rs.uploadId), uploadId);
+
+    const size_t expectedSize = sizeof(header) +
+            (header.dataSize > 0 ? static_cast<size_t>(header.dataSize) : 0);
+    if (header.dataSize <= 0 ||
+            header.dataSize > AV_UPLOAD_BLOCK_SIZE ||
+            packet.size() != expectedSize) {
+        copyText(rs.message, sizeof(rs.message), "invalid upload block payload");
+        sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+        return;
+    }
+
+    printf("received UPLOAD_BLOCK_RQ offset=%lld size=%d\n",
+           static_cast<long long>(header.offset), header.dataSize);
+    std::string message;
+    rs.result = m_uploadManager.writeBlock(uploadId,
+                                           header.offset,
+                                           packet.data() + sizeof(header),
+                                           header.dataSize,
+                                           &rs.receivedOffset,
+                                           &message) ? 1 : 0;
+    copyText(rs.message, sizeof(rs.message), message);
+    sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+    if (!rs.result)
+        printf("upload block rejected: %s\n", message.c_str());
+}
+
+void AVServer::handleUploadFinish(int clientFd, const std::vector<char> &packet)
+{
+    printf("received UPLOAD_FINISH_RQ\n");
+    STRU_UPLOAD_FINISH_RS rs;
+    if (packet.size() != sizeof(STRU_UPLOAD_FINISH_RQ)) {
+        copyText(rs.message, sizeof(rs.message), "invalid UPLOAD_FINISH_RQ size");
+        sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+        return;
+    }
+
+    STRU_UPLOAD_FINISH_RQ rq;
+    memcpy(&rq, packet.data(), sizeof(rq));
+    const std::string uploadId = boundedString(rq.uploadId, sizeof(rq.uploadId));
+    const std::string fileName = boundedString(rq.fileName, sizeof(rq.fileName));
+    std::string savedFileName;
+    std::string message;
+
+    rs.result = m_uploadManager.finishUpload(uploadId,
+                                             fileName,
+                                             rq.fileSize,
+                                             &savedFileName,
+                                             &message) ? 1 : 0;
+    copyText(rs.fileName, sizeof(rs.fileName), savedFileName);
+    copyText(rs.message, sizeof(rs.message), message);
+    sendPacket(clientFd, reinterpret_cast<const char *>(&rs), sizeof(rs));
+
+    if (rs.result) {
+        printf("upload finished\n");
+        printf("saved to media/%s\n", savedFileName.c_str());
+    } else {
+        printf("upload finish rejected: %s\n", message.c_str());
     }
 }
 
