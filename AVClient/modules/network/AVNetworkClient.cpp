@@ -27,7 +27,8 @@ bool copyUtf8Field(char *target, int capacity, const QString &value)
 
 AVNetworkClient::AVNetworkClient(QObject *parent)
     : QObject(parent),
-      m_tcpClient(new TcpClient(this))
+      m_tcpClient(new TcpClient(this)),
+      m_serverPort(0)
 {
     connect(m_tcpClient, SIGNAL(connected()), this, SLOT(onConnected()));
     connect(m_tcpClient, SIGNAL(connectFailed(QString)), this, SLOT(onConnectFailed(QString)));
@@ -43,8 +44,15 @@ AVNetworkClient::~AVNetworkClient()
 
 bool AVNetworkClient::connectToServer(const QString &ip, quint16 port)
 {
+    m_serverIp = ip.trimmed();
+    m_serverPort = port;
     emit logMessage(QString("connecting to %1:%2").arg(ip).arg(port));
-    return m_tcpClient->connectToServer(ip, port);
+    const bool connected = m_tcpClient->connectToServer(ip, port);
+    if (!connected) {
+        m_serverIp.clear();
+        m_serverPort = 0;
+    }
+    return connected;
 }
 
 void AVNetworkClient::disconnectFromServer()
@@ -98,7 +106,27 @@ bool AVNetworkClient::sendUploadInit(const QString &fileName,
     return ok;
 }
 
-bool AVNetworkClient::sendUploadBlock(const QString &uploadId,
+bool AVNetworkClient::sendUploadResume(const QString &transferId,
+                                       const QString &resumeToken,
+                                       const QString &fileName,
+                                       qint64 expectedSize)
+{
+    STRU_UPLOAD_RESUME_RQ rq;
+    if (!copyUtf8Field(rq.transferId, sizeof(rq.transferId), transferId) ||
+            !copyUtf8Field(rq.resumeToken, sizeof(rq.resumeToken), resumeToken) ||
+            !copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
+        emit logMessage("failed to send UPLOAD_RESUME_RQ: invalid metadata");
+        return false;
+    }
+    rq.expectedSize = expectedSize;
+
+    const bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq),
+                                             sizeof(rq));
+    emit logMessage(ok ? "sent UPLOAD_RESUME_RQ" : "failed to send UPLOAD_RESUME_RQ");
+    return ok;
+}
+
+bool AVNetworkClient::sendUploadBlock(const QString &transferId,
                                       qint64 offset,
                                       const QByteArray &data)
 {
@@ -108,8 +136,8 @@ bool AVNetworkClient::sendUploadBlock(const QString &uploadId,
     }
 
     STRU_UPLOAD_BLOCK_RQ_HEADER header;
-    if (!copyUtf8Field(header.uploadId, sizeof(header.uploadId), uploadId)) {
-        emit logMessage("failed to send UPLOAD_BLOCK_RQ: invalid upload id");
+    if (!copyUtf8Field(header.transferId, sizeof(header.transferId), transferId)) {
+        emit logMessage("failed to send UPLOAD_BLOCK_RQ: invalid transfer id");
         return false;
     }
     header.offset = offset;
@@ -126,12 +154,12 @@ bool AVNetworkClient::sendUploadBlock(const QString &uploadId,
     return ok;
 }
 
-bool AVNetworkClient::sendUploadFinish(const QString &uploadId,
+bool AVNetworkClient::sendUploadFinish(const QString &transferId,
                                        const QString &fileName,
                                        qint64 fileSize)
 {
     STRU_UPLOAD_FINISH_RQ rq;
-    if (!copyUtf8Field(rq.uploadId, sizeof(rq.uploadId), uploadId) ||
+    if (!copyUtf8Field(rq.transferId, sizeof(rq.transferId), transferId) ||
             !copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
         emit logMessage("failed to send UPLOAD_FINISH_RQ: invalid metadata");
         return false;
@@ -196,6 +224,16 @@ bool AVNetworkClient::sendDownloadFinish(const QString &fileName, qint64 fileSiz
 bool AVNetworkClient::isConnected() const
 {
     return m_tcpClient->isConnected();
+}
+
+QString AVNetworkClient::serverIp() const
+{
+    return m_serverIp;
+}
+
+quint16 AVNetworkClient::serverPort() const
+{
+    return m_serverPort;
 }
 
 void AVNetworkClient::onConnected()
@@ -279,10 +317,38 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         }
         STRU_UPLOAD_INIT_RS rs;
         memcpy(&rs, packet.constData(), sizeof(rs));
-        const QString uploadId = utf8Field(rs.uploadId, sizeof(rs.uploadId));
+        const QString transferId = utf8Field(rs.transferId, sizeof(rs.transferId));
+        const QString resumeToken = utf8Field(rs.resumeToken, sizeof(rs.resumeToken));
+        const QString finalFileName = utf8Field(rs.finalFileName,
+                                                sizeof(rs.finalFileName));
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         emit logMessage(QString("received UPLOAD_INIT_RS: %1").arg(message));
-        emit uploadInitResponse(rs.result != 0, uploadId, message);
+        emit uploadInitResponse(rs.result != 0,
+                                transferId,
+                                resumeToken,
+                                rs.resumeOffset,
+                                finalFileName,
+                                message);
+        break;
+    }
+    case DEF_PACK_UPLOAD_RESUME_RS:
+    {
+        if (packet.size() != static_cast<int>(sizeof(STRU_UPLOAD_RESUME_RS))) {
+            emit logMessage("received invalid UPLOAD_RESUME_RS");
+            return;
+        }
+        STRU_UPLOAD_RESUME_RS rs;
+        memcpy(&rs, packet.constData(), sizeof(rs));
+        const QString transferId = utf8Field(rs.transferId, sizeof(rs.transferId));
+        const QString finalFileName = utf8Field(rs.finalFileName,
+                                                sizeof(rs.finalFileName));
+        const QString message = utf8Field(rs.message, sizeof(rs.message));
+        emit logMessage(QString("received UPLOAD_RESUME_RS: %1").arg(message));
+        emit uploadResumeResponse(rs.result != 0,
+                                  transferId,
+                                  rs.resumeOffset,
+                                  finalFileName,
+                                  message);
         break;
     }
     case DEF_PACK_UPLOAD_BLOCK_RS:
@@ -293,10 +359,10 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         }
         STRU_UPLOAD_BLOCK_RS rs;
         memcpy(&rs, packet.constData(), sizeof(rs));
-        const QString uploadId = utf8Field(rs.uploadId, sizeof(rs.uploadId));
+        const QString transferId = utf8Field(rs.transferId, sizeof(rs.transferId));
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         emit uploadBlockResponse(rs.result != 0,
-                                 uploadId,
+                                 transferId,
                                  rs.receivedOffset,
                                  message);
         break;

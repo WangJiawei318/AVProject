@@ -23,10 +23,14 @@ public:
     bool sendUploadInit(const QString &fileName,
                         const QString &extension,
                         qint64 fileSize);
-    bool sendUploadBlock(const QString &uploadId,
+    bool sendUploadResume(const QString &transferId,
+                          const QString &resumeToken,
+                          const QString &fileName,
+                          qint64 expectedSize);
+    bool sendUploadBlock(const QString &transferId,
                          qint64 offset,
                          const QByteArray &data);
-    bool sendUploadFinish(const QString &uploadId,
+    bool sendUploadFinish(const QString &transferId,
                           const QString &fileName,
                           qint64 fileSize);
     bool sendDownloadInit(const QString &fileName);
@@ -35,6 +39,8 @@ public:
                            int requestSize);
     bool sendDownloadFinish(const QString &fileName, qint64 fileSize);
     bool isConnected() const;
+    QString serverIp() const;
+    quint16 serverPort() const;
 
 signals:
     void connectedChanged(bool connected);
@@ -43,10 +49,18 @@ signals:
     void loginResponse(bool success, const QString &message);
     void mediaListReceived(const QString &payload);
     void uploadInitResponse(bool success,
-                            const QString &uploadId,
+                            const QString &transferId,
+                            const QString &resumeToken,
+                            qint64 resumeOffset,
+                            const QString &finalFileName,
+                            const QString &message);
+    void uploadResumeResponse(bool success,
+                              const QString &transferId,
+                              qint64 resumeOffset,
+                              const QString &finalFileName,
                             const QString &message);
     void uploadBlockResponse(bool success,
-                             const QString &uploadId,
+                             const QString &transferId,
                              qint64 receivedOffset,
                              const QString &message);
     void uploadFinishResponse(bool success,
@@ -74,6 +88,8 @@ private slots:
 
 private:
     TcpClient *m_tcpClient;
+    QString m_serverIp;
+    quint16 m_serverPort;
 };
 
 #endif // AVNETWORKCLIENT_H

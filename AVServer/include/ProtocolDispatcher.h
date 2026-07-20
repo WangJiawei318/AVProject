@@ -1,6 +1,7 @@
 #ifndef PROTOCOLDISPATCHER_H
 #define PROTOCOLDISPATCHER_H
 
+#include <ctime>
 #include <vector>
 
 #include "DownloadManager.h"
@@ -17,6 +18,7 @@ public:
                   const std::vector<char> &packet,
                   std::vector<std::vector<char> > *responses);
     void onClientDisconnected(int clientFd);
+    void performMaintenance(std::time_t now);
 
 private:
     void handlePing(int clientFd,
@@ -28,6 +30,9 @@ private:
     void handleUploadInit(int clientFd,
                           const std::vector<char> &packet,
                           std::vector<std::vector<char> > *responses);
+    void handleUploadResume(int clientFd,
+                            const std::vector<char> &packet,
+                            std::vector<std::vector<char> > *responses);
     void handleUploadBlock(int clientFd,
                            const std::vector<char> &packet,
                            std::vector<std::vector<char> > *responses);

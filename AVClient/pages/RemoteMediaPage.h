@@ -4,6 +4,8 @@
 #include <QByteArray>
 #include <QWidget>
 
+#include "UploadTaskStore.h"
+
 class AVNetworkClient;
 class QLabel;
 class QFile;
@@ -29,10 +31,18 @@ private slots:
     void slotLogMessage(const QString &message);
     void slotUploadClicked();
     void slotUploadInitResponse(bool success,
-                                const QString &uploadId,
+                                const QString &transferId,
+                                const QString &resumeToken,
+                                qint64 resumeOffset,
+                                const QString &finalFileName,
                                 const QString &message);
+    void slotUploadResumeResponse(bool success,
+                                  const QString &transferId,
+                                  qint64 resumeOffset,
+                                  const QString &finalFileName,
+                                  const QString &message);
     void slotUploadBlockResponse(bool success,
-                                 const QString &uploadId,
+                                 const QString &transferId,
                                  qint64 receivedOffset,
                                  const QString &message);
     void slotUploadFinishResponse(bool success,
@@ -53,13 +63,21 @@ private slots:
     void slotDownloadFinishResponse(bool success,
                                     const QString &fileName,
                                     const QString &message);
+    void slotUploadTaskSelectionChanged();
+    void slotResumeUploadClicked();
+    void slotAbandonUploadClicked();
 
 private:
     void appendLog(const QString &message);
     void clearTable();
     void fillTable(const QString &payload);
     void sendNextUploadBlock();
+    void continueUploadAfterConfirmation();
     void finishUploadState(bool success, const QString &message);
+    bool saveCurrentUploadTask(const QString &status);
+    void refreshUploadTaskTable();
+    bool selectedUploadTask(UploadTaskState *task) const;
+    QString localTaskStatus(const UploadTaskState &task) const;
     bool isSupportedMediaFile(const QString &filePath) const;
     void startDownload(bool playAfterDownload);
     void requestNextDownloadBlock();
@@ -75,15 +93,22 @@ private:
     QPushButton *m_uploadButton;
     QLabel *m_uploadStatusLabel;
     QProgressBar *m_uploadProgress;
+    QTableWidget *m_uploadTaskTable;
+    QPushButton *m_resumeUploadButton;
+    QPushButton *m_abandonUploadButton;
     QTableWidget *m_table;
     QTextEdit *m_logEdit;
     QFile *m_uploadFile;
     QString m_uploadFileName;
-    QString m_uploadId;
+    QString m_transferId;
     qint64 m_uploadFileSize;
     qint64 m_confirmedOffset;
     qint64 m_expectedOffset;
     bool m_uploading;
+    bool m_resumingUpload;
+    bool m_hasCurrentUploadTask;
+    UploadTaskState m_currentUploadTask;
+    UploadTaskStore m_uploadTaskStore;
     QPushButton *m_downloadButton;
     QPushButton *m_downloadAndPlayButton;
     QLabel *m_selectedFileLabel;

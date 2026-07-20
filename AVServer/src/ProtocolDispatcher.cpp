@@ -46,12 +46,13 @@ bool ProtocolDispatcher::initialize()
     }
     std::printf("media directory: %s\n", m_mediaManager.mediaDir().c_str());
 
-    if (!m_uploadManager.ensureDirectories()) {
+    if (!m_uploadManager.initialize()) {
         std::printf("failed to create or open upload directory: %s\n",
                     m_uploadManager.tempDir().c_str());
         return false;
     }
     std::printf("upload temp directory: %s\n", m_uploadManager.tempDir().c_str());
+    std::printf("upload task directory: %s\n", m_uploadManager.tasksDir().c_str());
     return true;
 }
 
@@ -81,6 +82,9 @@ void ProtocolDispatcher::dispatch(int clientFd,
     case DEF_PACK_UPLOAD_INIT_RQ:
         handleUploadInit(clientFd, packet, responses);
         break;
+    case DEF_PACK_UPLOAD_RESUME_RQ:
+        handleUploadResume(clientFd, packet, responses);
+        break;
     case DEF_PACK_UPLOAD_BLOCK_RQ:
         handleUploadBlock(clientFd, packet, responses);
         break;
@@ -104,12 +108,19 @@ void ProtocolDispatcher::dispatch(int clientFd,
 
 void ProtocolDispatcher::onClientDisconnected(int clientFd)
 {
-    const size_t removed = m_uploadManager.abortByOwner(clientFd);
-    if (removed > 0) {
-        std::printf("cleaned unfinished uploads fd=%d count=%zu\n",
+    const size_t unbound = m_uploadManager.unbindConnection(clientFd);
+    if (unbound > 0) {
+        std::printf("upload tasks unbound fd=%d count=%zu\n",
                     clientFd,
-                    removed);
+                    unbound);
     }
+}
+
+void ProtocolDispatcher::performMaintenance(std::time_t now)
+{
+    const size_t removed = m_uploadManager.cleanupExpiredTasks(now);
+    if (removed > 0)
+        std::printf("upload task maintenance removed=%zu\n", removed);
 }
 
 void ProtocolDispatcher::handlePing(int clientFd,
@@ -166,20 +177,69 @@ void ProtocolDispatcher::handleUploadInit(int clientFd,
     std::memcpy(&request, packet.data(), sizeof(request));
     const std::string fileName = boundedString(request.fileName, sizeof(request.fileName));
     const std::string extension = boundedString(request.extension, sizeof(request.extension));
-    std::string uploadId;
+    std::string transferId;
+    std::string resumeToken;
+    std::string finalFileName;
     std::string message;
     response.result = m_uploadManager.createUpload(clientFd,
                                                     fileName,
                                                     extension,
                                                     request.fileSize,
-                                                    &uploadId,
+                                                    &transferId,
+                                                    &resumeToken,
+                                                    &response.resumeOffset,
+                                                    &finalFileName,
                                                     &message) ? 1 : 0;
-    copyText(response.uploadId, sizeof(response.uploadId), uploadId);
+    copyText(response.transferId, sizeof(response.transferId), transferId);
+    copyText(response.resumeToken, sizeof(response.resumeToken), resumeToken);
+    copyText(response.finalFileName, sizeof(response.finalFileName), finalFileName);
     copyText(response.message, sizeof(response.message), message);
     appendStructResponse(response, responses);
 
-    std::printf("UPLOAD_INIT_RQ fd=%d upload_id=%s file=%s result=%d\n",
-                clientFd, uploadId.c_str(), fileName.c_str(), response.result);
+    std::printf("UPLOAD_INIT_RQ fd=%d transfer_id=%s file=%s result=%d\n",
+                clientFd, transferId.c_str(), fileName.c_str(), response.result);
+}
+
+void ProtocolDispatcher::handleUploadResume(
+        int clientFd,
+        const std::vector<char> &packet,
+        std::vector<std::vector<char> > *responses)
+{
+    STRU_UPLOAD_RESUME_RS response;
+    if (packet.size() != sizeof(STRU_UPLOAD_RESUME_RQ)) {
+        copyText(response.message, sizeof(response.message),
+                 "invalid UPLOAD_RESUME_RQ size");
+        appendStructResponse(response, responses);
+        return;
+    }
+
+    STRU_UPLOAD_RESUME_RQ request;
+    std::memcpy(&request, packet.data(), sizeof(request));
+    const std::string transferId = boundedString(request.transferId,
+                                                  sizeof(request.transferId));
+    const std::string resumeToken = boundedString(request.resumeToken,
+                                                   sizeof(request.resumeToken));
+    const std::string fileName = boundedString(request.fileName,
+                                                sizeof(request.fileName));
+    std::string finalFileName;
+    std::string message;
+    response.result = m_uploadManager.resumeUpload(clientFd,
+                                                    transferId,
+                                                    resumeToken,
+                                                    fileName,
+                                                    request.expectedSize,
+                                                    &response.resumeOffset,
+                                                    &finalFileName,
+                                                    &message) ? 1 : 0;
+    copyText(response.transferId, sizeof(response.transferId), transferId);
+    copyText(response.finalFileName, sizeof(response.finalFileName), finalFileName);
+    copyText(response.message, sizeof(response.message), message);
+    appendStructResponse(response, responses);
+    std::printf("UPLOAD_RESUME_RQ fd=%d transfer_id=%s offset=%lld result=%d\n",
+                clientFd,
+                transferId.c_str(),
+                static_cast<long long>(response.resumeOffset),
+                response.result);
 }
 
 void ProtocolDispatcher::handleUploadBlock(int clientFd,
@@ -195,8 +255,9 @@ void ProtocolDispatcher::handleUploadBlock(int clientFd,
 
     STRU_UPLOAD_BLOCK_RQ_HEADER header;
     std::memcpy(&header, packet.data(), sizeof(header));
-    const std::string uploadId = boundedString(header.uploadId, sizeof(header.uploadId));
-    copyText(response.uploadId, sizeof(response.uploadId), uploadId);
+    const std::string transferId = boundedString(header.transferId,
+                                                  sizeof(header.transferId));
+    copyText(response.transferId, sizeof(response.transferId), transferId);
     const size_t expectedSize = sizeof(header) +
             (header.dataSize > 0 ? static_cast<size_t>(header.dataSize) : 0);
     if (header.dataSize <= 0 ||
@@ -209,7 +270,7 @@ void ProtocolDispatcher::handleUploadBlock(int clientFd,
 
     std::string message;
     response.result = m_uploadManager.writeBlock(clientFd,
-                                                  uploadId,
+                                                  transferId,
                                                   header.offset,
                                                   packet.data() + sizeof(header),
                                                   header.dataSize,
@@ -237,12 +298,13 @@ void ProtocolDispatcher::handleUploadFinish(int clientFd,
 
     STRU_UPLOAD_FINISH_RQ request;
     std::memcpy(&request, packet.data(), sizeof(request));
-    const std::string uploadId = boundedString(request.uploadId, sizeof(request.uploadId));
+    const std::string transferId = boundedString(request.transferId,
+                                                  sizeof(request.transferId));
     const std::string fileName = boundedString(request.fileName, sizeof(request.fileName));
     std::string savedFileName;
     std::string message;
     response.result = m_uploadManager.finishUpload(clientFd,
-                                                    uploadId,
+                                                    transferId,
                                                     fileName,
                                                     request.fileSize,
                                                     &savedFileName,
@@ -250,8 +312,8 @@ void ProtocolDispatcher::handleUploadFinish(int clientFd,
     copyText(response.fileName, sizeof(response.fileName), savedFileName);
     copyText(response.message, sizeof(response.message), message);
     appendStructResponse(response, responses);
-    std::printf("UPLOAD_FINISH_RQ fd=%d upload_id=%s saved=%s result=%d\n",
-                clientFd, uploadId.c_str(), savedFileName.c_str(), response.result);
+    std::printf("UPLOAD_FINISH_RQ fd=%d transfer_id=%s saved=%s result=%d\n",
+                clientFd, transferId.c_str(), savedFileName.c_str(), response.result);
 }
 
 void ProtocolDispatcher::handleDownloadInit(int clientFd,

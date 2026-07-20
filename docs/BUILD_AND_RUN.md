@@ -185,6 +185,7 @@ AVClient/
 │   ├── platforms/
 │   └── recordings/       # 默认录制输出
 ├── cache/                # 下载完成的媒体
+├── transfer_state/       # 未完成上传任务 JSON
 └── build-debug/          # 编译中间文件
 ```
 
@@ -210,7 +211,7 @@ make --version
 
 ## 8. Ubuntu 服务端构建
 
-确保阶段 7 的完整 `AVServer/` 已同步到 Ubuntu，尤其包括：
+确保当前阶段的完整 `AVServer/` 已同步到 Ubuntu，尤其包括：
 
 ```text
 AVServer/include/av_protocol.h
@@ -257,17 +258,18 @@ AVServer/AVServer
 ./AVServer
 ```
 
-阶段 7 启动后应看到类似日志：
+阶段 8 启动后应看到类似日志：
 
 ```text
 media directory: media
 upload temp directory: temp
+upload task directory: temp/tasks
 server started
 epoll initialized
 listening on port 8000
 ```
 
-客户端连接和协议日志会包含 `fd=...`，用于区分多个并发连接。
+客户端连接和协议日志会包含 `fd=...`，用于区分多个并发连接。若存在未完成任务，启动日志还会显示恢复的 transfer ID；不会打印完整 resume token。
 
 ## 9. 服务端运行目录
 
@@ -277,11 +279,14 @@ listening on port 8000
 AVServer/
 ├── AVServer             # Linux 可执行文件
 ├── media/               # 正式远程媒体
-└── temp/                # 上传中的 .part 文件
+└── temp/
+    ├── *.part            # 上传中的文件数据
+    └── tasks/*.task      # 可恢复任务元数据
 ```
 
 - `media/`：启动时自动创建，媒体列表只扫描这里。
-- `temp/`：启动时自动创建，上传未完成文件保存在这里。
+- `temp/`：启动时自动创建，上传未完成文件和任务元数据保存在这里。
+- `temp/tasks/`：小型键值任务文件；不要手工修改 token、offset 或路径。
 - `cache/`：属于 Windows 客户端，不在服务端。
 
 如果从其他目录执行绝对路径，`media/` 和 `temp/` 会创建在当前 shell 工作目录，而不是可执行文件旁边。
@@ -353,6 +358,21 @@ python3 tools/concurrent_client_test.py 192.168.44.130 8000 5 --pings 10 --media
 ```
 
 输出应显示每个 client 成功以及汇总中的 `failed=0`。当前长度头和结构体整数沿用主机小端格式，因此测试机与服务端应保持当前 x86/x86-64 小端环境。
+
+上传断点续传工具同样只使用 Python 标准库：
+
+```bash
+cd ~/AVProject
+python3 tools/resumable_upload_test.py 192.168.44.130 8000 \
+  --size-mb 8 --blocks-before-disconnect 20
+```
+
+工具会创建临时测试文件、上传若干块后主动断线、使用服务端返回的 transfer ID 与 token 重连恢复，并完成 FINISH。若测试脚本能直接访问服务端工作目录，还可增加：
+
+```bash
+python3 tools/resumable_upload_test.py 127.0.0.1 8000 \
+  --server-media-dir ./AVServer/media
+```
 
 ## 13. 推荐启动顺序
 

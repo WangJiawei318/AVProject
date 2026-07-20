@@ -41,6 +41,8 @@ AVProject 是一个面向音视频学习与工程整合的 C++ 客户端/服务�
 - TCP 连接、断开和 Ping/Pong。
 - 远程媒体列表刷新。
 - 64 KB 串行分片上传与进度显示。
+- 上传断点续传，以及 AVClient/AVServer 重启后的任务恢复。
+- 未完成上传任务列表、手动恢复和本地放弃记录。
 - 64 KB 串行分片下载与进度显示。
 - 下载到 `AVClient/cache/` 后自动切换播放页播放。
 
@@ -51,11 +53,13 @@ AVProject 是一个面向音视频学习与工程整合的 C++ 客户端/服务�
 - TCP 长度帧增量解析、非阻塞发送队列和部分写处理。
 - Ping、媒体列表、上传、下载协议分发。
 - 扫描 `media/` 生成远程媒体列表。
-- 上传文件先写入 `temp/*.part`，完成校验后移动到 `media/`。
+- 上传文件先写入 `temp/*.part`，任务元数据原子写入 `temp/tasks/*.task`，完成校验后移动到 `media/`。
+- 服务端启动时恢复未完成上传任务，并按 `.part` 实际大小返回安全恢复偏移。
+- 上传任务默认保留 72 小时，每 5 分钟低频清理一次过期且未绑定连接的任务。
 - 下载时按 offset 从 `media/` 读取指定分片。
 - 媒体扩展名白名单、文件名检查和路径穿越防护。
 - 上传同名文件自动增加 `_1`、`_2` 后缀。
-- 连接断开时只清理该连接拥有的未完成上传任务。
+- 连接断开时只解除上传任务的当前会话绑定，保留可恢复任务和 `.part` 文件。
 
 > 当前 `AVServer` 已完成 epoll 多客户端改造，采用单线程 Reactor。协议分发和 64 KB 文件读写仍在事件线程同步执行，尚未接入业务线程池，因此它是可演示的并发 I/O 版本，不等同于生产级高并发媒体服务器。
 
@@ -87,7 +91,7 @@ AVClient (Windows / Qt)
 │       └── Audio_Read
 ├── RemoteMediaPage
 │   ├── 媒体列表
-│   ├── 分片上传
+│   ├── 分片上传与任务恢复
 │   └── 分片下载与 cache
 ├── SettingsPage
 └── AVNetworkClient -> TcpClient / Winsock
@@ -100,7 +104,7 @@ AVServer (Ubuntu)
 ├── ConnectionContext：每连接接收缓冲、发送队列和状态
 ├── ProtocolDispatcher：协议分发与响应生成
 ├── MediaManager：扫描 media/
-├── UploadManager：temp/ -> media/
+├── UploadManager：temp/tasks 持久任务 + temp/*.part -> media/
 └── DownloadManager：从 media/ 分块读取
 ```
 
@@ -116,7 +120,8 @@ AVServer (Ubuntu)
 | 阶段 4 | 64 KB 分片上传 | 完成 |
 | 阶段 5 | 64 KB 分片下载与下载后播放 | 完成 |
 | 阶段 6 | 工程文档、架构说明与面试复盘 | 完成 |
-| 阶段 7 | epoll LT 单线程 Reactor 与多客户端并发 | 当前阶段 |
+| 阶段 7 | epoll LT 单线程 Reactor 与多客户端并发 | 完成 |
+| 阶段 8 | 上传断点续传与客户端/服务端任务恢复 | 当前阶段 |
 
 各阶段记录位于 [docs/stage_logs](docs/stage_logs/)。
 
@@ -132,12 +137,13 @@ AVProject/
 │   ├── pages/                 # 四个业务页面
 │   ├── deploy/                # DLL 部署脚本
 │   ├── bin/                   # 运行目录，不提交
-│   └── cache/                 # 下载缓存，不提交
+│   ├── cache/                 # 下载缓存，不提交
+│   └── transfer_state/        # 客户端未完成上传状态，不提交
 ├── AVServer/                  # 当前 Ubuntu 媒体服务器
 │   ├── include/               # Reactor、连接上下文、协议与业务管理器
 │   ├── src/                   # epoll 网络层和协议业务实现
 │   ├── media/                 # 正式媒体，不提交
-│   └── temp/                  # 上传临时文件，不提交
+│   └── temp/                  # .part 与 tasks/*.task，不提交
 ├── MediaPlayer/               # 原始播放器，保留
 ├── VideoRecorder/             # 原始录屏器，保留
 ├── NetDisk-Client/            # 原始客户端网络示例，保留
@@ -173,9 +179,9 @@ D:\Software\Qt\Tools\mingw730_32\bin\mingw32-make.exe -j4
 - 通用业务线程池和异步磁盘 I/O。
 - 用户注册、登录鉴权、权限和配额。
 - MySQL 媒体索引。
-- 断点续传、任务恢复和传输取消。
+- 下载断点续传和通用传输取消。
 - 多文件并行上传或下载。
-- MD5/SHA-256 内容完整性校验。
+- 服务端 MD5/SHA-256 强内容完整性校验。
 - 删除、重命名和搜索。
 - TCP 边下边播、FFmpeg 自定义 AVIO。
 - HLS、RTMP 推流服务或转码服务。
@@ -183,7 +189,7 @@ D:\Software\Qt\Tools\mingw730_32\bin\mingw32-make.exe -j4
 ## 后续优化方向
 
 1. 在保持 epoll 线程只管理连接状态的前提下，引入有界工作线程池处理磁盘 I/O 和耗时业务。
-2. 为传输任务增加 ID、取消、超时、断点和哈希校验。
+2. 在已有上传恢复基础上增加下载断点续传、通用取消和 SHA-256 校验。
 3. 加入用户认证、权限控制和可选数据库索引。
 4. 增加远程删除、重命名、搜索和分页。
 5. 统一第三方依赖目录与可配置构建路径。
@@ -198,3 +204,4 @@ D:\Software\Qt\Tools\mingw730_32\bin\mingw32-make.exe -j4
 - [完整测试流程](docs/TEST_WORKFLOW.md)
 - [面试问答复盘](docs/INTERVIEW_QA.md)
 - [阶段 7：epoll 多客户端改造](docs/stage_logs/STAGE7_EPOLL_MULTI_CLIENT.md)
+- [阶段 8：上传断点续传与任务恢复](docs/stage_logs/STAGE8_RESUMABLE_UPLOAD.md)

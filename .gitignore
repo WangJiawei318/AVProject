@@ -69,5 +69,6 @@ AVServer/temp/
 
 # AVClient runtime cache
 AVClient/cache/
+AVClient/transfer_state/
 AVClient/build*/
 AVClient/bin/

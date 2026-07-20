@@ -109,7 +109,8 @@ AVServer/include/av_protocol.h
 | `AV_TEXT_SIZE` | 128 | 响应消息 |
 | `AV_FILE_NAME_SIZE` | 256 | UTF-8 文件名缓冲 |
 | `AV_EXTENSION_SIZE` | 16 | 扩展名 |
-| `AV_UPLOAD_ID_SIZE` | 64 | 上传任务 ID |
+| `AV_TRANSFER_ID_SIZE` | 96 | 可恢复上传任务 ID |
+| `AV_RESUME_TOKEN_SIZE` | 128 | 上传恢复凭据缓冲区 |
 | `AV_UPLOAD_BLOCK_SIZE` | 65536 | 单个上传/下载分片上限 |
 
 结构体使用：
@@ -133,7 +134,7 @@ AVServer/include/av_protocol.h
 | 20005 | `MEDIA_LIST_RQ` | Client -> Server | 请求媒体列表 |
 | 20006 | `MEDIA_LIST_RS` | Server -> Client | 返回文本列表 |
 | 20007 | `UPLOAD_INIT_RQ` | Client -> Server | 初始化上传 |
-| 20008 | `UPLOAD_INIT_RS` | Server -> Client | 返回 upload_id |
+| 20008 | `UPLOAD_INIT_RS` | Server -> Client | 返回任务 ID、token 和初始偏移 |
 | 20009 | `UPLOAD_BLOCK_RQ` | Client -> Server | 上传一个动态分片 |
 | 20010 | `UPLOAD_BLOCK_RS` | Server -> Client | 确认已写 offset |
 | 20011 | `UPLOAD_FINISH_RQ` | Client -> Server | 提交上传 |
@@ -144,6 +145,8 @@ AVServer/include/av_protocol.h
 | 20016 | `DOWNLOAD_BLOCK_RS` | Server -> Client | 返回动态分片 |
 | 20017 | `DOWNLOAD_FINISH_RQ` | Client -> Server | 通知下载完成 |
 | 20018 | `DOWNLOAD_FINISH_RS` | Server -> Client | 返回完成确认 |
+| 20019 | `UPLOAD_RESUME_RQ` | Client -> Server | 携带任务凭据请求恢复上传 |
+| 20020 | `UPLOAD_RESUME_RS` | Server -> Client | 返回服务端确认的恢复偏移 |
 
 `LOGIN_RQ/RS` 目前不是正式用户系统，只是阶段 2 留下的协议测试结构。项目没有数据库用户认证。
 
@@ -232,9 +235,14 @@ Transferring
 Finishing
   -> UPLOAD_FINISH_RQ / UPLOAD_FINISH_RS
 Completed 或 Failed
+
+WaitingResume
+  -> UPLOAD_RESUME_RQ
+  -> UPLOAD_RESUME_RS(success, resume_offset)
+  -> Transferring
 ```
 
-客户端任意时刻只有一个未确认分片。
+客户端任意时刻只有一个未确认分片。普通上传从 INIT 返回的 offset 0 开始；恢复上传从 RESUME 返回的服务端确认偏移开始。
 
 ### 10.2 UPLOAD_INIT_RQ
 
@@ -258,17 +266,21 @@ extension: char[16]
 ```text
 type: int32
 result: int32
-uploadId: char[64]
+transferId: char[96]
+resumeToken: char[128]
+resumeOffset: int64
+finalFileName: char[256]
 message: char[128]
 ```
 
 成功时服务端创建：
 
 ```text
-temp/<upload_id>.part
+temp/<transfer_id>.part
+temp/tasks/<transfer_id>.task
 ```
 
-`upload_id` 用于后续 BLOCK 和 FINISH 找到对应任务。
+`transfer_id` 用于定位任务，`resume_token` 是恢复凭据。客户端收到成功响应后必须立即持久化两者；普通日志和 UI 不显示完整 token。`resumeOffset` 对新任务为 0。
 
 ### 10.4 UPLOAD_BLOCK_RQ
 
@@ -276,7 +288,7 @@ temp/<upload_id>.part
 
 ```text
 type: int32
-uploadId: char[64]
+transferId: char[96]
 offset: int64
 dataSize: int32
 ```
@@ -291,16 +303,18 @@ dataSize 字节二进制文件数据
 
 - `0 < dataSize <= 64 KB`；
 - 实际包长等于固定头加 `dataSize`；
-- `upload_id` 存在；
+- `transfer_id` 存在且当前连接已经绑定该任务；
 - `offset` 等于服务端当前 `receivedSize`；
 - 本块不越过 INIT 声明的总大小。
+
+如果 offset 小于服务端位置且整个分片已经被确认，服务端不重复写入，只返回当前 `receivedOffset`。如果 offset 大于服务端位置，或分片与当前位置发生部分重叠，服务端返回 offset mismatch 且不写盘。
 
 ### 10.5 UPLOAD_BLOCK_RS
 
 ```text
 type: int32
 result: int32
-uploadId: char[64]
+transferId: char[96]
 receivedOffset: int64
 message: char[128]
 ```
@@ -311,7 +325,7 @@ message: char[128]
 
 ```text
 type: int32
-uploadId: char[64]
+transferId: char[96]
 fileName: char[256]
 fileSize: int64
 ```
@@ -335,6 +349,37 @@ message: char[128]
 ```
 
 `fileName` 是服务端最终保存名，可能与原名不同。
+
+### 10.8 UPLOAD_RESUME_RQ
+
+```text
+type: int32
+transferId: char[96]
+resumeToken: char[128]
+fileName: char[256]
+expectedSize: int64
+```
+
+服务端同时校验任务 ID、token、原文件名和预期大小。只凭文件名或 transfer ID 不能恢复任务。若任务已经绑定其他活动连接，返回 `task already active`。
+
+### 10.9 UPLOAD_RESUME_RS
+
+```text
+type: int32
+result: int32
+transferId: char[96]
+resumeOffset: int64
+finalFileName: char[256]
+message: char[128]
+```
+
+`resumeOffset` 是服务端根据任务元数据和 `.part` 实际大小确认的安全位置，不采用客户端自报偏移。恢复成功后，客户端打开原文件并 seek 到该位置，再进入原有 BLOCK/ACK 循环。
+
+### 10.10 服务端任务元数据
+
+服务端为每个 uploading 任务保存一个小型键值文件，字段包括 transfer ID、token、原名、最终名、预期/已接收大小、临时路径、创建/更新时间和状态。更新流程是“写 `.tmp`、`fsync`、`rename` 覆盖”，降低崩溃留下半写元数据的概率。
+
+启动恢复时，如果元数据 `received_size` 与 `.part` 实际大小不一致，取两者较小值并在必要时截断超前的 `.part`。这会牺牲最后少量未同步状态，但不会跳过服务端无法可靠证明已经接收的字节。
 
 ## 11. 为什么上传分成 INIT / BLOCK / FINISH
 
@@ -492,6 +537,10 @@ message: char[128]
 - 只访问普通文件；
 - offset 连续性和总大小边界检查；
 - 上传 temp、下载 `.part` 隔离半成品。
+- 上传恢复同时校验 transfer ID、token、文件名和预期大小；
+- 同一上传任务的活动连接排他绑定；
+- 服务端重启时按元数据和 `.part` 实际大小确定安全偏移；
+- 72 小时上传任务过期清理。
 
 当前没有：
 
@@ -510,35 +559,29 @@ message: char[128]
 3. 使用主机字节序，不是标准网络字节序。
 4. 没有协议版本号和能力协商。
 5. 没有 request_id，多个并发请求难以关联。
-6. 上传有 upload_id，下载没有 download_id。
+6. 上传有 transfer ID 和恢复 token，下载仍没有持久任务 ID。
 7. 错误码只有 result 和字符串，无法程序化分类。
 8. 列表是分隔文本，没有转义协议、分页和总数。
 9. 串行 ACK 简单但高 RTT 下吞吐较低。
 10. 没有哈希，等长内容损坏无法发现。
-11. 没有超时、取消、重试和任务恢复。
+11. 上传已支持任务恢复和过期清理，但下载没有断点恢复，也没有通用取消和自动重试。
 12. 最大包长、块大小等能力没有协商。
 
-## 18. 如何扩展断点续传
+## 18. 当前上传断点续传与下载扩展方向
 
-需要增加：
+上传断点续传已经实现：
 
-```text
-任务 ID
-文件稳定标识：大小 + mtime + hash
-客户端已持久化 offset
-服务端任务元数据持久化
-RESUME_QUERY_RQ / RESUME_QUERY_RS
-任务超时与过期清理
-```
+1. INIT 生成 transfer ID 和随机 resume token。
+2. 客户端使用 JSON 文件持久化本地路径、mtime、服务器地址和确认 offset。
+3. 服务端使用键值任务文件持久化元数据，并保留 `.part`。
+4. 断线只解除 `active_owner_fd`，不删除任务。
+5. RESUME 同时校验 ID、token、文件名和预期大小。
+6. 服务端按实际已落盘状态返回安全 `resumeOffset`。
+7. FINISH 成功后移动到 `media/`，删除服务端元数据和客户端状态。
 
-上传恢复：
+安全边界：当前 token 来自 `/dev/urandom`，失败才回退 `std::random_device`；它能阻止只猜 transfer ID 的客户端，但未经过 TLS 保护，也没有绑定真实用户身份。当前文件一致性依赖文件名、大小、客户端 mtime、连续偏移和 `.part` 大小，不能识别“内容变化但大小和修改时间碰巧一致”的情况。
 
-1. 客户端重新提交文件标识。
-2. 服务端查找 `.part` 和任务记录。
-3. 返回安全恢复 offset。
-4. 客户端从该 offset 继续。
-
-下载恢复：
+下载恢复仍未实现，后续可按以下流程扩展：
 
 1. 客户端保留 `.part` 和元数据。
 2. INIT 携带本地大小和服务端文件版本。

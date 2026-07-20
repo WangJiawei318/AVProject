@@ -37,6 +37,8 @@ AVProject 是典型的客户端/服务端系统。
 │ MediaManager UploadManager DownloadManager
 │          │       │        │            │
 │        media/  temp/     media/         │
+│                ├─ *.part                │
+│                └─ tasks/*.task          │
 └────────────────────────────────────────┘
 ```
 
@@ -71,7 +73,7 @@ AVClient/ + AVServer/
 | --- | --- | --- |
 | `PlayerPage` | 本地文件、URL 和下载缓存播放 | `PlayerDialog` |
 | `RecorderPage` | 桌面、摄像头、麦克风录制 | `RecorderDialog` |
-| `RemoteMediaPage` | 列表、上传、下载、进度 | `AVNetworkClient` |
+| `RemoteMediaPage` | 列表、可恢复上传、下载、进度 | `AVNetworkClient`、`UploadTaskStore` |
 | `SettingsPage` | IP、端口、连接、断开、Ping | `AVNetworkClient` |
 
 `PlayerPage` 和 `RecorderPage` 是适配层：它们把原来独立窗口形式的 Dialog 嵌入统一客户端。
@@ -97,7 +99,7 @@ MainWindow
 3. 读满包体；
 4. 发出 `packetReceived(QByteArray)`。
 
-`AVNetworkClient` 解析业务包，再发出 Ping、列表、上传、下载等 Qt 信号。Qt 的跨线程 queued connection 让 UI 槽函数回到对象所属的主线程执行，因此接收线程不直接操作控件。
+`AVNetworkClient` 解析业务包，再发出 Ping、列表、上传、恢复、下载等 Qt 信号。Qt 的跨线程 queued connection 让 UI 槽函数回到对象所属的主线程执行，因此接收线程不直接操作控件。
 
 ## 5. 播放模块
 
@@ -237,9 +239,17 @@ Winsock TCP
 ```text
 选择文件
   -> UPLOAD_INIT
+  -> 保存客户端任务状态
   -> 循环 UPLOAD_BLOCK
+  -> 每个 ACK 更新 confirmed_offset
   -> UPLOAD_FINISH
   -> 刷新媒体列表
+
+断线或进程退出
+  -> 客户端保留 transfer_state
+  -> 服务端保留 temp/*.part 与 temp/tasks/*.task
+  -> 重连后 UPLOAD_RESUME
+  -> 从服务端 resume_offset 继续 BLOCK
 ```
 
 `RemoteMediaPage` 任意时刻只发送一个未确认分片。收到 `UPLOAD_BLOCK_RS` 后，才推进 offset 并发送下一块。
@@ -248,16 +258,32 @@ Winsock TCP
 
 服务端 `UploadManager` 保存：
 
-- `upload_id`；
-- 原文件名和扩展名；
-- 预期大小和已接收大小；
-- `temp/<upload_id>.part` 路径。
+- `transfer_id` 和随机 `resume_token`；
+- 原文件名、最终文件名和扩展名；
+- 预期大小和服务端已可靠写入大小；
+- `temp/<transfer_id>.part` 路径；
+- 创建、更新时间和任务状态；
+- 仅在内存中存在的 `active_owner_fd`。
 
-它要求每块 offset 等于当前已接收大小。完成时比较声明大小、累计大小和磁盘实际大小，然后把临时文件移动到 `media/`。
+每个任务还对应 `temp/tasks/<transfer_id>.task`。新建任务和每次分片落盘后都会把元数据先写到临时元数据文件，再 `rename` 覆盖正式任务文件。服务器重启时扫描该目录，将未完成任务重新装入内存。
+
+写块时要求 offset 严格连续。offset 小于已确认位置的完整重复块不会再次写入，服务端只回送当前确认偏移；offset 大于当前位置则拒绝。完成时比较声明大小、内存累计大小和 `.part` 实际大小，再把临时文件移动到 `media/` 并删除任务元数据。
 
 ### 9.3 temp 的意义
 
-上传中断时，半成品不会出现在媒体列表。只有 FINISH 成功的文件才进入 `media/`，这相当于一个简单的提交边界。
+上传中断时，半成品不会出现在媒体列表，但会作为可恢复状态保留。只有 FINISH 成功的文件才进入 `media/`，这相当于一个简单的提交边界。未绑定活动连接且 72 小时没有更新的 uploading 任务会被过期清理。
+
+### 9.4 客户端 UploadTaskStore
+
+客户端把每个未完成上传保存为 `AVClient/transfer_state/<transfer_id>.upload.json`。状态包含本地路径、文件大小、最后修改时间、服务器地址、任务 ID、token、确认偏移和状态。`QSaveFile` 负责临时文件写入与原子提交。
+
+AVClient 重启后会重新加载这些文件并显示在“未完成上传任务”表格。用户点击恢复时，客户端先验证本地文件仍存在，大小和最后修改时间未变化，并确认当前连接地址与任务记录一致；服务端验证 token 后返回真实 `resume_offset`，客户端再 seek 到该位置继续发送。token 不显示在普通 UI 日志中。
+
+### 9.5 任务身份与连接绑定
+
+`transfer_id` 用于定位任务，`resume_token` 用于证明调用方持有恢复凭据。当前还没有用户系统，所以 token 是临时能力凭据，不等同于账号权限。
+
+socket fd 会在重连后变化，服务端重启后也完全失效，因此不能作为永久任务身份。`active_owner_fd` 只表示“当前哪条连接正在操作此任务”：创建或恢复成功时绑定，连接关闭时解绑，同一时刻不允许另一连接恢复；解绑不会删除任务、元数据或 `.part`。
 
 ## 10. 下载模块
 
@@ -379,7 +405,7 @@ main()
 
 `ProtocolDispatcher` 持有 `MediaManager`、`UploadManager` 和 `DownloadManager`。它接收已经去掉长度头的完整包体，校验具体结构大小，调用业务管理器，再把一个或多个响应包体交还给网络层。这样 `EpollServer` 不理解媒体业务，业务管理器也不依赖 epoll。
 
-上传任务额外记录 `owner_fd`。BLOCK、FINISH 必须来自创建任务的连接；连接断开时只删除该 fd 的未完成任务和 `.part` 文件。下载继续使用 `filename + offset + request_size` 独立读取，没有跨客户端共享文件游标，多个客户端请求同一文件不会互相改变读取位置。
+上传任务的持久身份是 `transfer_id + resume_token`，`active_owner_fd` 只负责当前会话排他绑定。BLOCK、FINISH 必须来自已绑定连接；连接断开时只解绑，不删除任务。服务端启动时扫描 `temp/tasks/`，按元数据与 `.part` 实际大小的较小值修正安全偏移，并记录缺少元数据的孤立 `.part`。下载继续使用 `filename + offset + request_size` 独立读取，没有跨客户端共享文件游标，多个客户端请求同一文件不会互相改变读取位置。
 
 ### 14.5 与 NetDisk-Server 的关系
 
@@ -396,6 +422,8 @@ main()
 | 媒体索引 | 扫描目录 | 不依赖 MySQL |
 | 传输方式 | 64 KB 串行 ACK | 状态简单、内存固定 |
 | 上传落盘 | temp 后提交 | 不暴露半成品 |
+| 上传恢复身份 | transfer_id + resume_token | fd 变化后仍可恢复，并阻止只猜 ID 的客户端 |
+| 上传状态 | 客户端 JSON + 服务端键值元数据 | 不引入数据库即可跨进程恢复 |
 | 下载落盘 | cache `.part` 后改名 | 不播放半成品 |
 | 远程播放 | 完整下载后本地播放 | 复用播放器，不改 AVIO |
 | 页面通信 | signal/slot + MainWindow 中介 | 降低耦合 |
@@ -408,14 +436,17 @@ main()
 - 暂无工作线程池，不能利用多核并行业务处理；
 - 协议使用主机字节序和 packed struct，跨架构能力有限；
 - 没有认证、权限、配额和 TLS；
-- 没有任务持久化、断点和哈希；
-- 没有取消、超时和自动重试；
+- 已支持上传任务文件持久化和断点恢复，但没有下载断点续传；
+- 当前 token 不是真正用户权限，且没有 TLS；
+- 只校验大小、偏移和客户端本地修改时间，没有 SHA-256 强内容校验；
+- 没有通用取消和自动重试；客户端“放弃任务”只删除本地记录；
+- FINISH 已提交但客户端尚未收到响应时崩溃，可能留下需要人工放弃的本地状态记录；
 - 目录扫描没有分页。
 
 建议演进顺序：
 
 1. 为协议增加版本、网络字节序和明确整数编码。
-2. 为上传下载增加 task id、取消、超时和哈希。
+2. 为下载增加持久任务和断点，并为传输增加通用取消与 SHA-256 校验。
 3. 接入有界工作线程池，将磁盘 I/O 与耗时业务结果安全回投 epoll 线程。
 4. 增加用户认证和可选数据库索引。
 5. 最后评估自定义 AVIO、HTTP/HLS 或对象存储。

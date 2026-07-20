@@ -7,6 +7,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -14,6 +15,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QProgressBar>
+#include <QSignalBlocker>
 #include <QStringList>
 #include <QTableWidget>
 #include <QTextEdit>
@@ -29,6 +31,8 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
       m_confirmedOffset(0),
       m_expectedOffset(0),
       m_uploading(false),
+      m_resumingUpload(false),
+      m_hasCurrentUploadTask(false),
       m_downloadFile(new QFile(this)),
       m_downloadFileSize(0),
       m_downloadOffset(0),
@@ -56,6 +60,25 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
     m_uploadProgress->setValue(0);
     uploadRow->addWidget(m_uploadStatusLabel);
     uploadRow->addWidget(m_uploadProgress, 1);
+
+    m_uploadTaskTable = new QTableWidget(this);
+    m_uploadTaskTable->setColumnCount(5);
+    m_uploadTaskTable->setHorizontalHeaderLabels(
+                QStringList() << "File name" << "Size" << "Progress"
+                              << "Status" << "Server");
+    m_uploadTaskTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_uploadTaskTable->horizontalHeader()->setStretchLastSection(true);
+    m_uploadTaskTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_uploadTaskTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_uploadTaskTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_uploadTaskTable->setMaximumHeight(155);
+
+    auto *uploadTaskActions = new QHBoxLayout;
+    m_resumeUploadButton = new QPushButton("Resume upload", this);
+    m_abandonUploadButton = new QPushButton("Abandon task", this);
+    uploadTaskActions->addStretch();
+    uploadTaskActions->addWidget(m_resumeUploadButton);
+    uploadTaskActions->addWidget(m_abandonUploadButton);
 
     auto *downloadActions = new QHBoxLayout;
     m_selectedFileLabel = new QLabel("Selected: none", this);
@@ -89,6 +112,9 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
 
     root->addLayout(top);
     root->addLayout(uploadRow);
+    root->addWidget(new QLabel("Unfinished uploads", this));
+    root->addWidget(m_uploadTaskTable);
+    root->addLayout(uploadTaskActions);
     root->addLayout(downloadActions);
     root->addLayout(downloadProgressRow);
     root->addWidget(m_table);
@@ -97,6 +123,18 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
 
     connect(m_refreshButton, SIGNAL(clicked()), this, SLOT(slotRefreshClicked()));
     connect(m_uploadButton, SIGNAL(clicked()), this, SLOT(slotUploadClicked()));
+    connect(m_resumeUploadButton,
+            SIGNAL(clicked()),
+            this,
+            SLOT(slotResumeUploadClicked()));
+    connect(m_abandonUploadButton,
+            SIGNAL(clicked()),
+            this,
+            SLOT(slotAbandonUploadClicked()));
+    connect(m_uploadTaskTable,
+            SIGNAL(itemSelectionChanged()),
+            this,
+            SLOT(slotUploadTaskSelectionChanged()));
     connect(m_downloadButton, SIGNAL(clicked()), this, SLOT(slotDownloadClicked()));
     connect(m_downloadAndPlayButton,
             SIGNAL(clicked()),
@@ -110,9 +148,13 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
     connect(m_networkClient, SIGNAL(mediaListReceived(QString)), this, SLOT(slotMediaListReceived(QString)));
     connect(m_networkClient, SIGNAL(logMessage(QString)), this, SLOT(slotLogMessage(QString)));
     connect(m_networkClient,
-            SIGNAL(uploadInitResponse(bool,QString,QString)),
+            SIGNAL(uploadInitResponse(bool,QString,QString,qint64,QString,QString)),
             this,
-            SLOT(slotUploadInitResponse(bool,QString,QString)));
+            SLOT(slotUploadInitResponse(bool,QString,QString,qint64,QString,QString)));
+    connect(m_networkClient,
+            SIGNAL(uploadResumeResponse(bool,QString,qint64,QString,QString)),
+            this,
+            SLOT(slotUploadResumeResponse(bool,QString,qint64,QString,QString)));
     connect(m_networkClient,
             SIGNAL(uploadBlockResponse(bool,QString,qint64,QString)),
             this,
@@ -135,6 +177,7 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
             SLOT(slotDownloadFinishResponse(bool,QString,QString)));
 
     slotConnectedChanged(m_networkClient->isConnected());
+    refreshUploadTaskTable();
     appendLog("remote media page ready");
 }
 
@@ -208,11 +251,21 @@ void RemoteMediaPage::slotUploadClicked()
     }
 
     m_uploading = true;
+    m_resumingUpload = false;
+    m_hasCurrentUploadTask = false;
     m_uploadFileName = info.fileName();
     m_uploadFileSize = info.size();
     m_confirmedOffset = 0;
     m_expectedOffset = 0;
-    m_uploadId.clear();
+    m_transferId.clear();
+    m_currentUploadTask = UploadTaskState();
+    m_currentUploadTask.localFilePath = info.absoluteFilePath();
+    m_currentUploadTask.fileName = info.fileName();
+    m_currentUploadTask.fileSize = info.size();
+    m_currentUploadTask.lastModifiedMs = info.lastModified().toMSecsSinceEpoch();
+    m_currentUploadTask.serverIp = m_networkClient->serverIp();
+    m_currentUploadTask.serverPort = m_networkClient->serverPort();
+    m_currentUploadTask.status = "initializing";
     m_uploadProgress->setValue(0);
     m_uploadStatusLabel->setText(QString("Initializing %1").arg(m_uploadFileName));
     updateActionStates();
@@ -228,57 +281,106 @@ void RemoteMediaPage::slotUploadClicked()
 }
 
 void RemoteMediaPage::slotUploadInitResponse(bool success,
-                                             const QString &uploadId,
+                                             const QString &transferId,
+                                             const QString &resumeToken,
+                                             qint64 resumeOffset,
+                                             const QString &finalFileName,
                                              const QString &message)
 {
-    if (!m_uploading)
+    if (!m_uploading || m_resumingUpload)
         return;
-    if (!success || uploadId.isEmpty()) {
+    if (!success || transferId.isEmpty() || resumeToken.isEmpty() ||
+            resumeOffset != 0) {
         finishUploadState(false, QString("upload initialization failed: %1").arg(message));
         return;
     }
 
-    m_uploadId = uploadId;
+    m_transferId = transferId;
+    m_currentUploadTask.transferId = transferId;
+    m_currentUploadTask.resumeToken = resumeToken;
+    m_currentUploadTask.confirmedOffset = resumeOffset;
+    m_currentUploadTask.finalFileName = finalFileName;
+    m_hasCurrentUploadTask = true;
+    if (!saveCurrentUploadTask("uploading")) {
+        finishUploadState(false, "upload stopped: failed to save local recovery state");
+        return;
+    }
     m_uploadStatusLabel->setText(QString("Uploading %1").arg(m_uploadFileName));
-    appendLog(QString("upload initialized: id=%1").arg(uploadId));
-    QTimer::singleShot(0, this, [this]() {
-        sendNextUploadBlock();
-    });
+    appendLog(QString("upload initialized: transfer_id=%1").arg(transferId));
+    continueUploadAfterConfirmation();
+}
+
+void RemoteMediaPage::slotUploadResumeResponse(bool success,
+                                               const QString &transferId,
+                                               qint64 resumeOffset,
+                                               const QString &finalFileName,
+                                               const QString &message)
+{
+    if (!m_uploading || !m_resumingUpload)
+        return;
+    if (!success || transferId != m_transferId ||
+            resumeOffset < 0 || resumeOffset > m_uploadFileSize) {
+        finishUploadState(false, QString("upload resume failed: %1").arg(message));
+        return;
+    }
+
+    m_confirmedOffset = resumeOffset;
+    m_expectedOffset = resumeOffset;
+    m_currentUploadTask.confirmedOffset = resumeOffset;
+    m_currentUploadTask.finalFileName = finalFileName;
+    if (!saveCurrentUploadTask("uploading")) {
+        finishUploadState(false, "upload stopped: failed to update local recovery state");
+        return;
+    }
+    m_uploadProgress->setValue(
+                static_cast<int>((m_confirmedOffset * 100) / m_uploadFileSize));
+    m_uploadStatusLabel->setText(QString("Uploading %1").arg(m_uploadFileName));
+    appendLog(QString("upload resumed at %1 bytes").arg(resumeOffset));
+    continueUploadAfterConfirmation();
 }
 
 void RemoteMediaPage::slotUploadBlockResponse(bool success,
-                                              const QString &uploadId,
+                                              const QString &transferId,
                                               qint64 receivedOffset,
                                               const QString &message)
 {
     if (!m_uploading)
         return;
-    if (!success || uploadId != m_uploadId) {
+    if (transferId != m_transferId) {
+        finishUploadState(false, "upload block failed: transfer id mismatch");
+        return;
+    }
+    if (!success && message == "offset mismatch" &&
+            receivedOffset >= 0 && receivedOffset <= m_uploadFileSize) {
+        m_confirmedOffset = receivedOffset;
+        m_expectedOffset = receivedOffset;
+        m_currentUploadTask.confirmedOffset = receivedOffset;
+        if (!saveCurrentUploadTask("uploading")) {
+            finishUploadState(false, "upload stopped: failed to save corrected offset");
+            return;
+        }
+        appendLog(QString("upload offset corrected to %1").arg(receivedOffset));
+        continueUploadAfterConfirmation();
+        return;
+    }
+    if (!success) {
         finishUploadState(false, QString("upload block failed: %1").arg(message));
         return;
     }
-    if (receivedOffset != m_expectedOffset) {
+    if (receivedOffset < m_expectedOffset || receivedOffset > m_uploadFileSize) {
         finishUploadState(false, "server returned an invalid upload offset");
         return;
     }
 
     m_confirmedOffset = receivedOffset;
-    const int progress = static_cast<int>((m_confirmedOffset * 100) / m_uploadFileSize);
-    m_uploadProgress->setValue(progress);
-
-    if (m_confirmedOffset == m_uploadFileSize) {
-        m_uploadStatusLabel->setText(QString("Finalizing %1").arg(m_uploadFileName));
-        if (!m_networkClient->sendUploadFinish(m_uploadId,
-                                               m_uploadFileName,
-                                               m_uploadFileSize)) {
-            finishUploadState(false, "failed to send upload completion request");
-        }
+    m_currentUploadTask.confirmedOffset = receivedOffset;
+    if (!saveCurrentUploadTask("uploading")) {
+        finishUploadState(false, "upload stopped: failed to persist confirmed offset");
         return;
     }
-
-    QTimer::singleShot(0, this, [this]() {
-        sendNextUploadBlock();
-    });
+    const int progress = static_cast<int>((m_confirmedOffset * 100) / m_uploadFileSize);
+    m_uploadProgress->setValue(progress);
+    continueUploadAfterConfirmation();
 }
 
 void RemoteMediaPage::slotUploadFinishResponse(bool success,
@@ -296,6 +398,109 @@ void RemoteMediaPage::slotUploadFinishResponse(bool success,
     const QString savedName = fileName.isEmpty() ? m_uploadFileName : fileName;
     finishUploadState(true, QString("upload completed: %1").arg(savedName));
     slotRefreshClicked();
+}
+
+void RemoteMediaPage::slotUploadTaskSelectionChanged()
+{
+    updateActionStates();
+}
+
+void RemoteMediaPage::slotResumeUploadClicked()
+{
+    if (m_uploading || m_downloading)
+        return;
+
+    UploadTaskState task;
+    if (!selectedUploadTask(&task)) {
+        QMessageBox::information(this, "Resume upload",
+                                 "Please select an unfinished upload task.");
+        return;
+    }
+    if (!m_networkClient->isConnected()) {
+        QMessageBox::information(this, "Resume upload",
+                                 QString("Connect to %1:%2 first.")
+                                 .arg(task.serverIp)
+                                 .arg(task.serverPort));
+        return;
+    }
+    if (m_networkClient->serverIp() != task.serverIp ||
+            m_networkClient->serverPort() != task.serverPort) {
+        QMessageBox::warning(this, "Resume upload",
+                             QString("This task belongs to %1:%2.")
+                             .arg(task.serverIp)
+                             .arg(task.serverPort));
+        return;
+    }
+
+    const QFileInfo info(task.localFilePath);
+    if (!info.exists() || !info.isFile()) {
+        QMessageBox::warning(this, "Resume upload", "The local source file is missing.");
+        refreshUploadTaskTable();
+        return;
+    }
+    if (info.size() != task.fileSize ||
+            info.lastModified().toMSecsSinceEpoch() != task.lastModifiedMs) {
+        QMessageBox::warning(this, "Resume upload",
+                             "The local source file has changed. Resume is disabled.");
+        refreshUploadTaskTable();
+        return;
+    }
+
+    m_uploadFile->setFileName(task.localFilePath);
+    if (!m_uploadFile->open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, "Resume upload",
+                             QString("Cannot open the local file: %1")
+                             .arg(m_uploadFile->errorString()));
+        return;
+    }
+
+    m_uploading = true;
+    m_resumingUpload = true;
+    m_hasCurrentUploadTask = true;
+    m_currentUploadTask = task;
+    m_transferId = task.transferId;
+    m_uploadFileName = task.fileName;
+    m_uploadFileSize = task.fileSize;
+    m_confirmedOffset = task.confirmedOffset;
+    m_expectedOffset = task.confirmedOffset;
+    m_uploadProgress->setValue(
+                static_cast<int>((m_confirmedOffset * 100) / m_uploadFileSize));
+    m_uploadStatusLabel->setText(QString("Resuming %1").arg(task.fileName));
+    updateActionStates();
+    appendLog(QString("requesting upload resume: transfer_id=%1")
+              .arg(task.transferId));
+
+    if (!m_networkClient->sendUploadResume(task.transferId,
+                                           task.resumeToken,
+                                           task.fileName,
+                                           task.fileSize)) {
+        finishUploadState(false, "failed to send upload resume request");
+    }
+}
+
+void RemoteMediaPage::slotAbandonUploadClicked()
+{
+    UploadTaskState task;
+    if (!selectedUploadTask(&task)) {
+        QMessageBox::information(this, "Abandon upload",
+                                 "Please select an unfinished upload task.");
+        return;
+    }
+    if (QMessageBox::question(this,
+                              "Abandon upload",
+                              QString("Remove the local recovery record for %1?\n"
+                                      "The server will remove its partial file after expiry.")
+                              .arg(task.fileName)) != QMessageBox::Yes) {
+        return;
+    }
+
+    QString error;
+    if (!m_uploadTaskStore.remove(task.transferId, &error)) {
+        QMessageBox::warning(this, "Abandon upload", error);
+        return;
+    }
+    appendLog(QString("local upload task abandoned: %1").arg(task.fileName));
+    refreshUploadTaskTable();
 }
 
 void RemoteMediaPage::slotSelectionChanged()
@@ -474,7 +679,7 @@ void RemoteMediaPage::fillTable(const QString &payload)
 
 void RemoteMediaPage::sendNextUploadBlock()
 {
-    if (!m_uploading || m_uploadId.isEmpty())
+    if (!m_uploading || m_transferId.isEmpty())
         return;
     if (!m_networkClient->isConnected()) {
         finishUploadState(false, "upload stopped: server disconnected");
@@ -495,8 +700,28 @@ void RemoteMediaPage::sendNextUploadBlock()
     }
 
     m_expectedOffset = m_confirmedOffset + block.size();
-    if (!m_networkClient->sendUploadBlock(m_uploadId, m_confirmedOffset, block))
+    if (!m_networkClient->sendUploadBlock(m_transferId, m_confirmedOffset, block))
         finishUploadState(false, "failed to send upload block");
+}
+
+void RemoteMediaPage::continueUploadAfterConfirmation()
+{
+    if (!m_uploading)
+        return;
+    refreshUploadTaskTable();
+    if (m_confirmedOffset == m_uploadFileSize) {
+        m_uploadStatusLabel->setText(QString("Finalizing %1").arg(m_uploadFileName));
+        if (!m_networkClient->sendUploadFinish(m_transferId,
+                                               m_uploadFileName,
+                                               m_uploadFileSize)) {
+            finishUploadState(false, "failed to send upload completion request");
+        }
+        return;
+    }
+
+    QTimer::singleShot(0, this, [this]() {
+        sendNextUploadBlock();
+    });
 }
 
 void RemoteMediaPage::finishUploadState(bool success, const QString &message)
@@ -504,8 +729,21 @@ void RemoteMediaPage::finishUploadState(bool success, const QString &message)
     if (m_uploadFile->isOpen())
         m_uploadFile->close();
 
+    if (m_hasCurrentUploadTask) {
+        QString error;
+        if (success) {
+            if (!m_uploadTaskStore.remove(m_currentUploadTask.transferId, &error))
+                appendLog(QString("warning: failed to remove local upload task: %1").arg(error));
+        } else if (!saveCurrentUploadTask("waiting")) {
+            appendLog("warning: failed to preserve local upload recovery state");
+        }
+    }
+
     m_uploading = false;
-    m_uploadId.clear();
+    m_resumingUpload = false;
+    m_hasCurrentUploadTask = false;
+    m_currentUploadTask = UploadTaskState();
+    m_transferId.clear();
     m_uploadFileName.clear();
     m_uploadFileSize = 0;
     m_confirmedOffset = 0;
@@ -514,7 +752,98 @@ void RemoteMediaPage::finishUploadState(bool success, const QString &message)
     if (success)
         m_uploadProgress->setValue(100);
     appendLog(message);
+    refreshUploadTaskTable();
     updateActionStates();
+}
+
+bool RemoteMediaPage::saveCurrentUploadTask(const QString &status)
+{
+    if (!m_hasCurrentUploadTask || m_currentUploadTask.transferId.isEmpty())
+        return false;
+    m_currentUploadTask.confirmedOffset = m_confirmedOffset;
+    m_currentUploadTask.status = status;
+    QString error;
+    if (!m_uploadTaskStore.save(m_currentUploadTask, &error)) {
+        appendLog(QString("failed to save local upload task: %1").arg(error));
+        return false;
+    }
+    return true;
+}
+
+void RemoteMediaPage::refreshUploadTaskTable()
+{
+    const QSignalBlocker blocker(m_uploadTaskTable);
+    const QString selectedId = m_uploadTaskTable->currentRow() >= 0 &&
+            m_uploadTaskTable->item(m_uploadTaskTable->currentRow(), 0)
+            ? m_uploadTaskTable->item(m_uploadTaskTable->currentRow(), 0)
+              ->data(Qt::UserRole).toString()
+            : QString();
+
+    QStringList warnings;
+    const QList<UploadTaskState> tasks = m_uploadTaskStore.loadAll(&warnings);
+    m_uploadTaskTable->setRowCount(0);
+    int selectedRow = -1;
+    for (const UploadTaskState &task : tasks) {
+        const int row = m_uploadTaskTable->rowCount();
+        m_uploadTaskTable->insertRow(row);
+        QTableWidgetItem *nameItem = new QTableWidgetItem(task.fileName);
+        nameItem->setData(Qt::UserRole, task.transferId);
+        m_uploadTaskTable->setItem(row, 0, nameItem);
+        m_uploadTaskTable->setItem(row, 1,
+                                   new QTableWidgetItem(QString::number(task.fileSize)));
+        const int progress = static_cast<int>((task.confirmedOffset * 100) /
+                                              task.fileSize);
+        m_uploadTaskTable->setItem(row, 2,
+                                   new QTableWidgetItem(QString("%1%").arg(progress)));
+        m_uploadTaskTable->setItem(row, 3,
+                                   new QTableWidgetItem(localTaskStatus(task)));
+        m_uploadTaskTable->setItem(row, 4,
+                                   new QTableWidgetItem(QString("%1:%2")
+                                                        .arg(task.serverIp)
+                                                        .arg(task.serverPort)));
+        if (task.transferId == selectedId)
+            selectedRow = row;
+    }
+    if (selectedRow >= 0)
+        m_uploadTaskTable->selectRow(selectedRow);
+    for (const QString &warning : warnings)
+        appendLog(QString("upload task warning: %1").arg(warning));
+    updateActionStates();
+}
+
+bool RemoteMediaPage::selectedUploadTask(UploadTaskState *task) const
+{
+    if (!task)
+        return false;
+    const int row = m_uploadTaskTable->currentRow();
+    QTableWidgetItem *item = row >= 0 ? m_uploadTaskTable->item(row, 0) : nullptr;
+    if (!item)
+        return false;
+    const QString transferId = item->data(Qt::UserRole).toString();
+    const QList<UploadTaskState> tasks = m_uploadTaskStore.loadAll();
+    for (const UploadTaskState &candidate : tasks) {
+        if (candidate.transferId == transferId) {
+            *task = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+QString RemoteMediaPage::localTaskStatus(const UploadTaskState &task) const
+{
+    const QFileInfo info(task.localFilePath);
+    if (!info.exists() || !info.isFile())
+        return "Local file missing";
+    if (info.size() != task.fileSize ||
+            info.lastModified().toMSecsSinceEpoch() != task.lastModifiedMs) {
+        return "Local file changed";
+    }
+    if (m_uploading && m_hasCurrentUploadTask &&
+            task.transferId == m_currentUploadTask.transferId) {
+        return m_resumingUpload ? "Resuming" : "Uploading";
+    }
+    return task.status == "uploading" ? "Waiting to resume" : task.status;
 }
 
 bool RemoteMediaPage::isSupportedMediaFile(const QString &filePath) const
@@ -626,4 +955,7 @@ void RemoteMediaPage::updateActionStates()
     m_uploadButton->setEnabled(!transferBusy);
     m_downloadButton->setEnabled(!transferBusy);
     m_downloadAndPlayButton->setEnabled(!transferBusy);
+    const bool uploadTaskSelected = m_uploadTaskTable->currentRow() >= 0;
+    m_resumeUploadButton->setEnabled(uploadTaskSelected && !transferBusy);
+    m_abandonUploadButton->setEnabled(uploadTaskSelected && !transferBusy);
 }

@@ -23,12 +23,15 @@ static const int32_t DEF_PACK_DOWNLOAD_BLOCK_RQ = DEF_PACK_BASE + 15;
 static const int32_t DEF_PACK_DOWNLOAD_BLOCK_RS = DEF_PACK_BASE + 16;
 static const int32_t DEF_PACK_DOWNLOAD_FINISH_RQ = DEF_PACK_BASE + 17;
 static const int32_t DEF_PACK_DOWNLOAD_FINISH_RS = DEF_PACK_BASE + 18;
+static const int32_t DEF_PACK_UPLOAD_RESUME_RQ = DEF_PACK_BASE + 19;
+static const int32_t DEF_PACK_UPLOAD_RESUME_RS = DEF_PACK_BASE + 20;
 
 static const int AV_NAME_SIZE = 32;
 static const int AV_TEXT_SIZE = 128;
 static const int AV_FILE_NAME_SIZE = 256;
 static const int AV_EXTENSION_SIZE = 16;
-static const int AV_UPLOAD_ID_SIZE = 64;
+static const int AV_TRANSFER_ID_SIZE = 96;
+static const int AV_RESUME_TOKEN_SIZE = 128;
 static const int AV_UPLOAD_BLOCK_SIZE = 64 * 1024;
 
 typedef int32_t PackType;
@@ -132,15 +135,59 @@ struct STRU_UPLOAD_INIT_RS
 {
     STRU_UPLOAD_INIT_RS()
         : type(DEF_PACK_UPLOAD_INIT_RS),
-          result(0)
+          result(0),
+          resumeOffset(0)
     {
-        memset(uploadId, 0, sizeof(uploadId));
+        memset(transferId, 0, sizeof(transferId));
+        memset(resumeToken, 0, sizeof(resumeToken));
+        memset(finalFileName, 0, sizeof(finalFileName));
         memset(message, 0, sizeof(message));
     }
 
     PackType type;
     int32_t result;
-    char uploadId[AV_UPLOAD_ID_SIZE];
+    char transferId[AV_TRANSFER_ID_SIZE];
+    char resumeToken[AV_RESUME_TOKEN_SIZE];
+    int64_t resumeOffset;
+    char finalFileName[AV_FILE_NAME_SIZE];
+    char message[AV_TEXT_SIZE];
+};
+
+struct STRU_UPLOAD_RESUME_RQ
+{
+    STRU_UPLOAD_RESUME_RQ()
+        : type(DEF_PACK_UPLOAD_RESUME_RQ),
+          expectedSize(0)
+    {
+        memset(transferId, 0, sizeof(transferId));
+        memset(resumeToken, 0, sizeof(resumeToken));
+        memset(fileName, 0, sizeof(fileName));
+    }
+
+    PackType type;
+    char transferId[AV_TRANSFER_ID_SIZE];
+    char resumeToken[AV_RESUME_TOKEN_SIZE];
+    char fileName[AV_FILE_NAME_SIZE];
+    int64_t expectedSize;
+};
+
+struct STRU_UPLOAD_RESUME_RS
+{
+    STRU_UPLOAD_RESUME_RS()
+        : type(DEF_PACK_UPLOAD_RESUME_RS),
+          result(0),
+          resumeOffset(0)
+    {
+        memset(transferId, 0, sizeof(transferId));
+        memset(finalFileName, 0, sizeof(finalFileName));
+        memset(message, 0, sizeof(message));
+    }
+
+    PackType type;
+    int32_t result;
+    char transferId[AV_TRANSFER_ID_SIZE];
+    int64_t resumeOffset;
+    char finalFileName[AV_FILE_NAME_SIZE];
     char message[AV_TEXT_SIZE];
 };
 
@@ -151,11 +198,11 @@ struct STRU_UPLOAD_BLOCK_RQ_HEADER
           offset(0),
           dataSize(0)
     {
-        memset(uploadId, 0, sizeof(uploadId));
+        memset(transferId, 0, sizeof(transferId));
     }
 
     PackType type;
-    char uploadId[AV_UPLOAD_ID_SIZE];
+    char transferId[AV_TRANSFER_ID_SIZE];
     int64_t offset;
     int32_t dataSize;
 };
@@ -167,13 +214,13 @@ struct STRU_UPLOAD_BLOCK_RS
           result(0),
           receivedOffset(0)
     {
-        memset(uploadId, 0, sizeof(uploadId));
+        memset(transferId, 0, sizeof(transferId));
         memset(message, 0, sizeof(message));
     }
 
     PackType type;
     int32_t result;
-    char uploadId[AV_UPLOAD_ID_SIZE];
+    char transferId[AV_TRANSFER_ID_SIZE];
     int64_t receivedOffset;
     char message[AV_TEXT_SIZE];
 };
@@ -184,12 +231,12 @@ struct STRU_UPLOAD_FINISH_RQ
         : type(DEF_PACK_UPLOAD_FINISH_RQ),
           fileSize(0)
     {
-        memset(uploadId, 0, sizeof(uploadId));
+        memset(transferId, 0, sizeof(transferId));
         memset(fileName, 0, sizeof(fileName));
     }
 
     PackType type;
-    char uploadId[AV_UPLOAD_ID_SIZE];
+    char transferId[AV_TRANSFER_ID_SIZE];
     char fileName[AV_FILE_NAME_SIZE];
     int64_t fileSize;
 };

@@ -18,7 +18,8 @@
 
 EpollServer::EpollServer()
     : m_listenFd(-1),
-      m_epollFd(-1)
+      m_epollFd(-1),
+      m_lastMaintenance(0)
 {
 }
 
@@ -49,10 +50,14 @@ bool EpollServer::start(uint16_t port)
                 kMaxPacketLength,
                 kMaxQueuedBytesPerConnection);
     std::printf("listening on port %u\n", static_cast<unsigned>(port));
+    m_lastMaintenance = std::time(nullptr);
 
     epoll_event events[kMaxEvents];
     while (true) {
-        const int ready = epoll_wait(m_epollFd, events, kMaxEvents, -1);
+        const int ready = epoll_wait(m_epollFd,
+                                     events,
+                                     kMaxEvents,
+                                     kEpollWaitTimeoutMs);
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
@@ -99,6 +104,12 @@ bool EpollServer::start(uint16_t port)
 
             if ((flags & (EPOLLHUP | EPOLLRDHUP)) != 0)
                 closeConnection(fd, "peer hangup");
+        }
+
+        const std::time_t now = std::time(nullptr);
+        if (now >= m_lastMaintenance + kMaintenanceIntervalSeconds) {
+            m_dispatcher.performMaintenance(now);
+            m_lastMaintenance = now;
         }
     }
 }
