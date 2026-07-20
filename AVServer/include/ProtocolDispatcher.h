@@ -1,6 +1,8 @@
 #ifndef PROTOCOLDISPATCHER_H
 #define PROTOCOLDISPATCHER_H
 
+#include <stdint.h>
+#include <string>
 #include <ctime>
 #include <vector>
 
@@ -14,10 +16,16 @@ public:
     ProtocolDispatcher();
 
     bool initialize();
-    void dispatch(int clientFd,
+    bool isBusinessPacket(const std::vector<char> &packet,
+                          int32_t *protocolType = nullptr) const;
+    void dispatch(uint64_t connectionId,
+                  int clientFd,
                   const std::vector<char> &packet,
                   std::vector<std::vector<char> > *responses);
-    void onClientDisconnected(int clientFd);
+    void buildErrorResponse(const std::vector<char> &packet,
+                            const std::string &message,
+                            std::vector<std::vector<char> > *responses) const;
+    void onClientDisconnected(uint64_t connectionId, int clientFd);
     void performMaintenance(std::time_t now);
 
 private:
@@ -25,27 +33,35 @@ private:
                     std::vector<std::vector<char> > *responses);
     void handleLogin(int clientFd,
                      std::vector<std::vector<char> > *responses);
-    void handleMediaList(int clientFd,
+    void handleMediaList(uint64_t connectionId,
+                         int clientFd,
                          std::vector<std::vector<char> > *responses);
-    void handleUploadInit(int clientFd,
+    void handleUploadInit(uint64_t connectionId,
+                          int clientFd,
                           const std::vector<char> &packet,
                           std::vector<std::vector<char> > *responses);
-    void handleUploadResume(int clientFd,
+    void handleUploadResume(uint64_t connectionId,
+                            int clientFd,
                             const std::vector<char> &packet,
                             std::vector<std::vector<char> > *responses);
-    void handleUploadBlock(int clientFd,
+    void handleUploadBlock(uint64_t connectionId,
+                           int clientFd,
                            const std::vector<char> &packet,
                            std::vector<std::vector<char> > *responses);
-    void handleUploadFinish(int clientFd,
+    void handleUploadFinish(uint64_t connectionId,
+                            int clientFd,
                             const std::vector<char> &packet,
                             std::vector<std::vector<char> > *responses);
-    void handleDownloadInit(int clientFd,
+    void handleDownloadInit(uint64_t connectionId,
+                            int clientFd,
                             const std::vector<char> &packet,
                             std::vector<std::vector<char> > *responses);
-    void handleDownloadBlock(int clientFd,
+    void handleDownloadBlock(uint64_t connectionId,
+                             int clientFd,
                              const std::vector<char> &packet,
                              std::vector<std::vector<char> > *responses);
-    void handleDownloadFinish(int clientFd,
+    void handleDownloadFinish(uint64_t connectionId,
+                              int clientFd,
                               const std::vector<char> &packet,
                               std::vector<std::vector<char> > *responses);
 

@@ -588,7 +588,7 @@ message: char[128]
 1. INIT 生成 transfer ID 和随机 resume token。
 2. 客户端使用 JSON 文件持久化本地路径、mtime、服务器地址和确认 offset。
 3. 服务端使用键值任务文件持久化元数据，并保留 `.part`。
-4. 断线只解除 `active_owner_fd`，不删除任务。
+4. 断线只解除内存中的 `active_owner_connection_id`，不删除任务。
 5. RESUME 同时校验 ID、token、文件名和预期大小。
 6. 服务端按实际已落盘状态返回安全 `resumeOffset`。
 7. FINISH 成功后移动到 `media/`，删除服务端元数据和客户端状态。
@@ -641,3 +641,34 @@ block_index 或 offset
 - 超时和取消；
 - 任务优先级；
 - 失败重试策略。
+
+## 21. 阶段 10：协议调度与线程池过载处理
+
+阶段 10 **没有改变线上帧格式和业务结构体**。客户端仍然发送“4 字节包长度 + 协议包体”，阶段 1 至 9 的客户端不需要因为服务端加入线程池而修改。`connectionId`、`businessTaskInFlight`、`completionQueue` 和 `eventfd` 都是 AVServer 进程内部的调度机制，不在线上传输，也不是用户身份或恢复凭证。
+
+服务端收到完整帧后按协议类型分流：
+
+```text
+PING_RQ
+  -> Reactor 直接生成 PING_RS
+
+MEDIA_LIST_RQ / UPLOAD_* / DOWNLOAD_*
+  -> 有界业务线程池
+  -> 生成一个或多个协议响应
+  -> completionQueue
+  -> eventfd 唤醒 Reactor
+  -> Reactor 写入对应连接的 sendQueue
+```
+
+每个连接最多只有一个业务任务在线程池中执行。后续完整帧可以继续被 `recv()` 收入该连接的 `receiveBuffer`，但要等当前任务完成后再分发。因此同一连接上的上传分片、下载请求和列表请求仍按接收顺序执行；不同连接可以由不同 worker 并行处理。
+
+线程池队列达到上限时，`submit()` 返回失败。服务端清除该连接的 in-flight 状态，并构造与原请求类型匹配的失败响应，消息为 `server busy`，而不是让连接永久停住。当前媒体列表响应没有统一的 `result/message` 字段，所以列表过载错误仍以文本 payload 返回；这是现有协议错误模型不统一的一个限制，后续可通过通用错误包或统一响应头改进。
+
+工作线程只接收协议包副本、`connectionId` 和仅供日志使用的 fd，不持有 `ConnectionContext*`，也不直接调用 `send()` 或 `epoll_ctl()`。完成结果回投后，Reactor 必须再次按 `connectionId` 验证连接是否存在；若客户端已经断开，即使旧 fd 被操作系统复用，结果也会被丢弃，不会发送给新连接。
+
+阶段 10 后协议层仍有以下边界：
+
+- packed struct 和整数仍依赖当前小端环境，尚无协议版本与网络字节序转换；
+- 没有统一错误码、request ID、用户鉴权或 TLS；
+- `server busy` 是即时拒绝，不包含客户端退避时间，也不会自动重试；
+- 有界线程池改善了 Reactor 被同步文件 I/O 阻塞的问题，但不等于已经达到生产级高并发能力。

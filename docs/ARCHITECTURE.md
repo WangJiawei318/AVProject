@@ -263,7 +263,7 @@ Winsock TCP
 - 预期大小和服务端已可靠写入大小；
 - `temp/<transfer_id>.part` 路径；
 - 创建、更新时间和任务状态；
-- 仅在内存中存在的 `active_owner_fd`。
+- 仅在内存中存在的 `active_owner_connection_id`。
 
 每个任务还对应 `temp/tasks/<transfer_id>.task`。新建任务和每次分片落盘后都会把元数据先写到临时元数据文件，再 `rename` 覆盖正式任务文件。服务器重启时扫描该目录，将未完成任务重新装入内存。
 
@@ -283,7 +283,7 @@ AVClient 重启后会重新加载这些文件并显示在“未完成上传任�
 
 `transfer_id` 用于定位任务，`resume_token` 用于证明调用方持有恢复凭据。当前还没有用户系统，所以 token 是临时能力凭据，不等同于账号权限。
 
-socket fd 会在重连后变化，服务端重启后也完全失效，因此不能作为永久任务身份。`active_owner_fd` 只表示“当前哪条连接正在操作此任务”：创建或恢复成功时绑定，连接关闭时解绑，同一时刻不允许另一连接恢复；解绑不会删除任务、元数据或 `.part`。
+socket fd 会在重连后变化，还可能被内核复用，服务端重启后也完全失效，因此不能作为永久任务身份。`active_owner_connection_id` 只表示“当前哪条连接正在操作此任务”：创建或恢复成功时绑定，连接关闭时解绑，同一时刻不允许另一连接恢复；解绑不会删除任务、元数据或 `.part`。connectionId 也不会被持久化，永久恢复凭证仍是 transfer ID 与 resume token。
 
 ## 10. 下载模块
 
@@ -385,12 +385,17 @@ main()
       -> EpollServer::start(8000)
           -> 创建 non-blocking listen socket
           -> bind / listen / epoll_create1
+          -> 创建 eventfd 和 4 个核心 worker
           -> epoll_wait LT 事件循环
               -> accept 新连接到 EAGAIN
-              -> 为每个 fd 创建 ConnectionContext
+              -> 为每个 fd 创建 connectionId + ConnectionContext
               -> EPOLLIN: recv 到 EAGAIN，增量解析长度帧
-              -> ProtocolDispatcher 生成响应包体
-              -> 加入该连接 sendQueue
+              -> Ping 等轻量包直接生成响应
+              -> 文件业务提交有界 ThreadPool
+                    -> ProtocolDispatcher / Manager / 文件 I/O
+                    -> completionQueue
+                    -> eventfd 唤醒 Reactor
+              -> Reactor 校验 connectionId 后加入 sendQueue
               -> EPOLLOUT: 从 sendOffset 继续发送
               -> 错误或断开: 只清理当前 fd
 ```
@@ -399,21 +404,23 @@ main()
 
 ### 14.2 当前并发能力
 
-当前服务器采用单线程 Reactor：一个 epoll 实例同时关注 listen fd 和所有 client fd。每个连接都有独立 `ConnectionContext`，因此某个连接等待网络数据、发生半包或发送暂时不可写时，不会阻止服务器处理其他已就绪连接。
+当前服务器采用单线程 Reactor + 有界动态业务线程池。一个 epoll 实例同时关注 listen fd、eventfd 和所有 client fd。每个连接都有独立 `ConnectionContext`，因此某个连接等待网络数据、发生半包或发送暂时不可写时，不会阻止服务器处理其他已就绪连接。
 
-这里的“并发”指多个连接的 I/O 状态被事件循环交替推进，不代表多核并行执行。媒体目录扫描、上传写盘和下载读盘当前仍在 Reactor 线程同步完成；慢磁盘或耗时文件操作仍可能短暂拖延其他连接，后续应在不改变协议的前提下接入有界工作线程池。
+Reactor 独占 socket I/O、epoll_ctl、连接和发送队列；4 至 8 个 worker 并行执行媒体目录扫描、上传元数据与文件写入、下载文件读取和业务响应生成。任务队列上限 256，非核心 worker 空闲 60 秒退出。文件 I/O 仍是同步调用，只是从 Reactor 移到 worker，因此它改善了连接响应隔离，但不是异步 I/O 或生产级无限并发。
 
 ### 14.3 ConnectionContext
 
 每个 client fd 对应一个 `ConnectionContext`，保存：
 
 - 对端 IP 和端口；
+- 单调递增且不复用的 `connectionId`；
 - 独立 `receiveBuffer`；
 - 独立 `sendQueue`、当前发送项及 offset；
 - 已排队但尚未发送的字节数；
 - 最后活动时间与连接状态。
+- `businessTaskInFlight`，限制同连接最多一个业务任务在线程池执行。
 
-接收时先把任意数量的字节追加到 `receiveBuffer`。缓冲区不足 4 字节时继续等待；读到包长后先校验范围，数据不足一个完整包时仍继续等待。取出完整包后立即继续解析缓冲区，因此同一轮既能处理半包，也能处理粘在一起的多个包。当前长度头沿用阶段 1 至 5 的主机字节序，最大包体限制为 256 KB。
+接收时先把任意数量的字节追加到 `receiveBuffer`。缓冲区不足 4 字节时继续等待；读到包长后先校验范围，数据不足一个完整包时仍继续等待。当前长度头沿用主机字节序，最大包体 256 KB，单连接接收缓冲上限 4 MB。业务任务在途时仍继续 recv，但暂停分发后续完整帧；completion 到达后再从原缓冲顺序继续。
 
 响应先被封装成“4 字节长度 + 包体”并进入该连接的发送队列。服务器立即尝试 `send()`；如果只写出一部分，就保存 offset 并注册 `EPOLLOUT`。队列清空后取消 `EPOLLOUT`，避免 socket 长期可写导致事件循环空转。单连接队列上限为 4 MB，慢客户端持续不读时会被关闭，防止无限占用内存。
 
@@ -421,20 +428,31 @@ main()
 
 `ProtocolDispatcher` 持有 `MediaManager`、`UploadManager` 和 `DownloadManager`。它接收已经去掉长度头的完整包体，校验具体结构大小，调用业务管理器，再把一个或多个响应包体交还给网络层。这样 `EpollServer` 不理解媒体业务，业务管理器也不依赖 epoll。
 
-上传任务的持久身份是 `transfer_id + resume_token`，`active_owner_fd` 只负责当前会话排他绑定。BLOCK、FINISH 必须来自已绑定连接；连接断开时只解绑，不删除任务。服务端启动时扫描 `temp/tasks/`，按元数据与 `.part` 实际大小的较小值修正安全偏移，并记录缺少元数据的孤立 `.part`。下载继续使用 `filename + offset + request_size` 独立读取，没有跨客户端共享文件游标；恢复时只增加文件 size/mtime 与 requested offset 校验，仍不建立服务端下载任务。
+PING/LOGIN 可由 Reactor 直接调用 Dispatcher；媒体列表及上传、下载协议由 worker 调用。Dispatcher 不直接 send、不调用 epoll_ctl，也不接收 ConnectionContext。
 
-### 14.5 与 NetDisk-Server 的关系
+上传任务的持久身份仍是 `transfer_id + resume_token`，当前会话排他绑定改为 `active_owner_connection_id`。UploadManager 用一把 mutex 保护任务 map、偏移、重名、绑定和过期清理。下载继续使用 `filename + offset + request_size` 无状态读取，不建立服务端下载任务，也不共享文件游标。
 
-原始 `NetDisk-Server` 包含 epoll、线程池、协议分发和 MySQL 示例。主线 `AVServer` 现在吸收了 epoll Reactor 和协议分层思想，但没有照搬网盘业务、MySQL 或线程池。
+### 14.5 completionQueue 与 eventfd
 
-本阶段先把连接生命周期、增量收包和非阻塞发送做稳定。后续线程池应作为独立阶段加入，并为 ConnectionContext 生命周期、响应回投和同一上传任务的顺序提供明确约束。
+worker 生成 `CompletedTask` 后，在 mutex 下移动到 completion queue，再向唯一 eventfd 写 1。Reactor 被 epoll 唤醒，批量 swap 出结果，按 connectionId 查找当前连接。连接已关闭或 fd 已复用时丢弃 completion；连接仍有效时才清除 in-flight、排队响应并继续解析缓存。
+
+工作线程不持有 ConnectionContext 指针，因此断开不会产生悬空访问。断开时和迟到 completion 被丢弃时都会尝试解除上传会话绑定，覆盖“INIT 在断开回调之后才完成”的竞态。
+
+### 14.6 与 NetDisk-Server 的关系
+
+原始 `NetDisk-Server` 包含 epoll、线程池、协议分发和 MySQL 示例。主线 `AVServer` 吸收了 Reactor、生产者消费者和协议分层思想，但线程池、completion/eventfd 与连接身份按当前媒体业务重新实现，没有照搬网盘业务或 MySQL。
+
+主线保持“Reactor 拥有连接，worker 拥有业务调用”的单向边界。后续若增加更复杂调度，应继续通过不可变任务和 completion 回投，而不是让 worker 直接操作连接。
 
 ## 15. 关键设计取舍
 
 | 取舍 | 当前选择 | 原因 |
 | --- | --- | --- |
-| 服务端并发 | epoll LT 单线程 Reactor | 支持多连接，同时控制第一版复杂度 |
-| 文件 I/O | Reactor 内同步 64 KB 读写 | 暂不引入线程池和跨线程生命周期问题 |
+| 服务端并发 | epoll LT Reactor + 4 至 8 个 worker | 网络状态串行、业务可并行 |
+| 任务队列 | 有界 256 | 过载返回 server busy，避免无限内存增长 |
+| 完成通知 | completion queue + 单 eventfd | worker 不直接操作 socket 或 epoll |
+| 同连接顺序 | 一个 business task in-flight | 保证上传分片和响应顺序 |
+| 文件 I/O | worker 内同步 64 KB 读写 | 隔离 Reactor，但尚非异步 I/O |
 | 媒体索引 | 扫描目录 | 不依赖 MySQL |
 | 传输方式 | 64 KB 串行 ACK | 状态简单、内存固定 |
 | 上传落盘 | temp 后提交 | 不暴露半成品 |
@@ -450,14 +468,15 @@ main()
 
 当前限制：
 
-- Reactor 中仍有同步目录扫描和文件 I/O；
-- 暂无工作线程池，不能利用多核并行业务处理；
+- 已有有界动态业务线程池，但扩缩容只依据 pending/idle，缺少生产级负载指标；
+- 文件 I/O 仍是 worker 中的同步调用；UploadManager 粗粒度锁会限制多上传并行；
 - 协议使用主机字节序和 packed struct，跨架构能力有限；
 - 没有认证、权限、配额和 TLS；
 - 已支持上传和下载断点续传；上传状态在客户端和服务端持久化，下载状态仅在客户端持久化；
 - 当前 token 不是真正用户权限，且没有 TLS；
 - 只校验大小、偏移和修改时间等元数据，没有 SHA-256 强内容校验；
 - 没有通用取消和自动重试；客户端“放弃任务”只删除本地记录；
+- 没有任务优先级、工作窃取和客户端同连接多业务并行；
 - FINISH 已提交但客户端尚未收到响应时崩溃，可能留下需要人工放弃的本地状态记录；
 - 目录扫描没有分页。
 
@@ -465,6 +484,6 @@ main()
 
 1. 为协议增加版本、网络字节序和明确整数编码。
 2. 为传输增加通用取消、稳定文件版本标识与 SHA-256 校验。
-3. 接入有界工作线程池，将磁盘 I/O 与耗时业务结果安全回投 epoll 线程。
+3. 完善线程池任务指标、超时治理和 UploadManager 细粒度并发控制。
 4. 增加用户认证和可选数据库索引。
 5. 最后评估自定义 AVIO、HTTP/HLS 或对象存储。

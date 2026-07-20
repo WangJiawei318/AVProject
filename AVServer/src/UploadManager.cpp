@@ -73,16 +73,17 @@ UploadManager::~UploadManager()
 
 bool UploadManager::initialize()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!ensureDirectories())
         return false;
     if (!loadPersistedTasks())
         return false;
-    cleanupExpiredTasks(std::time(nullptr));
+    cleanupExpiredTasksUnlocked(std::time(nullptr));
     scanOrphanPartFiles();
     return true;
 }
 
-bool UploadManager::createUpload(int ownerFd,
+bool UploadManager::createUpload(uint64_t ownerConnectionId,
                                  const std::string &fileName,
                                  const std::string &extension,
                                  int64_t fileSize,
@@ -92,6 +93,7 @@ bool UploadManager::createUpload(int ownerFd,
                                  std::string *finalFileName,
                                  std::string *message)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!transferId || !resumeToken || !resumeOffset || !finalFileName || !message)
         return false;
     if (!ensureDirectories()) {
@@ -125,7 +127,7 @@ bool UploadManager::createUpload(int ownerFd,
     task.createdTime = std::time(nullptr);
     task.updatedTime = task.createdTime;
     task.status = "uploading";
-    task.activeOwnerFd = ownerFd;
+    task.activeOwnerConnectionId = ownerConnectionId;
 
     const int partFd = open(task.tempPath.c_str(),
                             O_WRONLY | O_CREAT | O_EXCL,
@@ -151,7 +153,7 @@ bool UploadManager::createUpload(int ownerFd,
     return true;
 }
 
-bool UploadManager::resumeUpload(int ownerFd,
+bool UploadManager::resumeUpload(uint64_t ownerConnectionId,
                                  const std::string &transferId,
                                  const std::string &resumeToken,
                                  const std::string &fileName,
@@ -160,6 +162,7 @@ bool UploadManager::resumeUpload(int ownerFd,
                                  std::string *finalFileName,
                                  std::string *message)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!resumeOffset || !finalFileName || !message)
         return false;
     *resumeOffset = 0;
@@ -186,7 +189,7 @@ bool UploadManager::resumeUpload(int ownerFd,
     }
 
     const std::time_t now = std::time(nullptr);
-    if (task.activeOwnerFd < 0 &&
+    if (task.activeOwnerConnectionId == 0 &&
             now >= task.updatedTime &&
             now - task.updatedTime > kTaskTtlSeconds) {
         const int64_t expiredSize = task.receivedSize;
@@ -198,7 +201,8 @@ bool UploadManager::resumeUpload(int ownerFd,
         *message = "task expired";
         return false;
     }
-    if (task.activeOwnerFd >= 0 && task.activeOwnerFd != ownerFd) {
+    if (task.activeOwnerConnectionId != 0 &&
+            task.activeOwnerConnectionId != ownerConnectionId) {
         *message = "task already active";
         return false;
     }
@@ -207,10 +211,10 @@ bool UploadManager::resumeUpload(int ownerFd,
         return false;
     }
 
-    task.activeOwnerFd = ownerFd;
+    task.activeOwnerConnectionId = ownerConnectionId;
     task.updatedTime = now;
     if (!persistTask(task)) {
-        task.activeOwnerFd = -1;
+        task.activeOwnerConnectionId = 0;
         *message = "failed to persist resumed task";
         return false;
     }
@@ -221,7 +225,7 @@ bool UploadManager::resumeUpload(int ownerFd,
     return true;
 }
 
-bool UploadManager::writeBlock(int ownerFd,
+bool UploadManager::writeBlock(uint64_t ownerConnectionId,
                                const std::string &transferId,
                                int64_t offset,
                                const char *data,
@@ -229,6 +233,7 @@ bool UploadManager::writeBlock(int ownerFd,
                                int64_t *receivedOffset,
                                std::string *message)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!receivedOffset || !message)
         return false;
 
@@ -245,7 +250,7 @@ bool UploadManager::writeBlock(int ownerFd,
         *message = "task is not uploading";
         return false;
     }
-    if (task.activeOwnerFd != ownerFd) {
+    if (task.activeOwnerConnectionId != ownerConnectionId) {
         *message = "task is not bound to this connection";
         return false;
     }
@@ -323,13 +328,14 @@ bool UploadManager::writeBlock(int ownerFd,
     return true;
 }
 
-bool UploadManager::finishUpload(int ownerFd,
+bool UploadManager::finishUpload(uint64_t ownerConnectionId,
                                  const std::string &transferId,
                                  const std::string &fileName,
                                  int64_t fileSize,
                                  std::string *savedFileName,
                                  std::string *message)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!savedFileName || !message)
         return false;
     std::map<std::string, UploadTask>::iterator it = m_tasks.find(transferId);
@@ -339,7 +345,7 @@ bool UploadManager::finishUpload(int ownerFd,
     }
 
     UploadTask &task = it->second;
-    if (task.activeOwnerFd != ownerFd) {
+    if (task.activeOwnerConnectionId != ownerConnectionId) {
         *message = "task is not bound to this connection";
         return false;
     }
@@ -384,13 +390,14 @@ bool UploadManager::finishUpload(int ownerFd,
     return true;
 }
 
-size_t UploadManager::unbindConnection(int ownerFd)
+size_t UploadManager::unbindConnection(uint64_t ownerConnectionId)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     size_t count = 0;
     for (std::map<std::string, UploadTask>::iterator it = m_tasks.begin();
          it != m_tasks.end(); ++it) {
-        if (it->second.activeOwnerFd == ownerFd) {
-            it->second.activeOwnerFd = -1;
+        if (it->second.activeOwnerConnectionId == ownerConnectionId) {
+            it->second.activeOwnerConnectionId = 0;
             ++count;
         }
     }
@@ -399,12 +406,18 @@ size_t UploadManager::unbindConnection(int ownerFd)
 
 size_t UploadManager::cleanupExpiredTasks(std::time_t now)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return cleanupExpiredTasksUnlocked(now);
+}
+
+size_t UploadManager::cleanupExpiredTasksUnlocked(std::time_t now)
+{
     size_t removed = 0;
     std::map<std::string, UploadTask>::iterator it = m_tasks.begin();
     while (it != m_tasks.end()) {
         UploadTask &task = it->second;
         if (task.status == "uploading" &&
-                task.activeOwnerFd < 0 &&
+                task.activeOwnerConnectionId == 0 &&
                 now >= task.updatedTime &&
                 now - task.updatedTime > kTaskTtlSeconds) {
             std::printf("expired upload removed transfer_id=%s bytes=%lld\n",
@@ -481,7 +494,7 @@ bool UploadManager::loadPersistedTasks()
             continue;
         }
 
-        task.activeOwnerFd = -1;
+        task.activeOwnerConnectionId = 0;
         m_tasks[task.transferId] = task;
         ++loaded;
         std::printf("restored upload task transfer_id=%s offset=%lld file=%s\n",
@@ -535,7 +548,7 @@ bool UploadManager::loadTaskFile(const std::string &path,
     task->createdTime = static_cast<std::time_t>(created);
     task->updatedTime = static_cast<std::time_t>(updated);
     task->extension = extensionOf(task->originalFileName);
-    task->activeOwnerFd = -1;
+    task->activeOwnerConnectionId = 0;
 
     const std::string expectedTempPath = m_tempDir + "/" + task->transferId + ".part";
     if (!isSafeIdentifier(task->transferId) ||

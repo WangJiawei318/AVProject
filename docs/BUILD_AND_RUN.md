@@ -219,6 +219,7 @@ AVServer/include/av_protocol.h
 AVServer/include/AVServer.h
 AVServer/include/ConnectionContext.h
 AVServer/include/EpollServer.h
+AVServer/include/ThreadPool.h
 AVServer/include/ProtocolDispatcher.h
 AVServer/include/MediaManager.h
 AVServer/include/UploadManager.h
@@ -226,6 +227,7 @@ AVServer/include/DownloadManager.h
 AVServer/src/AVServer.cpp
 AVServer/src/ConnectionContext.cpp
 AVServer/src/EpollServer.cpp
+AVServer/src/ThreadPool.cpp
 AVServer/src/ProtocolDispatcher.cpp
 AVServer/src/MediaManager.cpp
 AVServer/src/UploadManager.cpp
@@ -259,18 +261,23 @@ AVServer/AVServer
 ./AVServer
 ```
 
-阶段 9 启动后应看到类似日志：
+阶段 10 启动后应看到类似日志：
 
 ```text
 media directory: media
 upload temp directory: temp
 upload task directory: temp/tasks
-server started
-epoll initialized
+AVServer started
+epoll LT reactor initialized
+eventfd initialized
+core worker count=4
+max worker count=8
+task queue capacity=256
+non-core idle timeout=60s
 listening on port 8000
 ```
 
-客户端连接和协议日志会包含 `fd=...`，用于区分多个并发连接。若存在未完成任务，启动日志还会显示恢复的 transfer ID；不会打印完整 resume token。
+`Makefile` 使用 `-pthread` 并编译 `ThreadPool.cpp`。客户端连接、任务提交和完成日志会同时包含 `fd=...`、`connectionId=...` 与协议类型，用于区分多个并发连接。若存在未完成上传任务，启动日志还会显示恢复的 transfer ID；不会打印完整 resume token。
 
 ## 9. 服务端运行目录
 
@@ -384,6 +391,26 @@ python3 tools/resumable_download_test.py 192.168.44.130 8000 test.mp4 \
 ```
 
 它会下载若干 64 KB 分片后主动断线，把 `.part` 和 JSON 状态写入输出目录，再以非零 offset 重连并完成下载。脚本验证 accepted offset 和最终文件大小，不播放文件。下载恢复不需要服务端任务目录；AVServer 仅重新检查远程文件大小、修改时间和请求偏移。
+
+阶段 10 业务线程池并发测试：
+
+```bash
+cd ~/AVProject
+python3 tools/thread_pool_concurrency_test.py \
+  192.168.44.130 8000 \
+  --clients 10 --requests 20
+```
+
+脚本只使用 Python 标准库：同步启动多个连接、重复发送 Ping 和媒体列表请求、主动断开其中一个连接，并验证其余连接仍可继续。若要并发验证下载分片，可增加：
+
+```bash
+python3 tools/thread_pool_concurrency_test.py \
+  192.168.44.130 8000 \
+  --clients 10 --requests 20 \
+  --download-file test.mp4 --download-blocks 4
+```
+
+启动时应有 4 个核心 worker。任务明显积压时观察 `thread pool expanded`，线程总数不得超过 8；任务结束并空闲约 60 秒后，应看到非核心 worker 因 `idle_timeout` 退出并恢复到 4 个。正式业务代码没有为测试加入 `sleep`。
 
 ## 13. 推荐启动顺序
 

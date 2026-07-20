@@ -19,13 +19,18 @@ make
 确认打印：
 
 ```text
-server started
+AVServer started
 media directory: media
 upload temp directory: temp
+epoll LT reactor initialized
+eventfd initialized
+core worker count=4
+max worker count=8
+task queue capacity=256
 listening on port 8000
 ```
 
-还应看到 `epoll initialized` 和上传任务目录。若有未完成任务，日志会显示恢复任务及安全偏移。后续连接和协议日志应带有 `fd=...`。
+还应看到上传任务目录和 4 个核心 worker 的创建日志。若有未完成任务，日志会显示恢复任务及安全偏移。后续连接和协议日志应带有 `fd=...`、`connectionId=...` 和协议类型。
 
 ## 3. 启动并连接客户端
 
@@ -133,7 +138,29 @@ python3 tools/resumable_download_test.py 192.168.44.130 8000 test.mp4 \
 
 完成后确认 `.part` 改为正式 cache 文件、下载状态已删除；“下载并播放”任务恢复完成后应自动切换 Player 页。放弃任务应删除本地状态和 `.part`。
 
-## 9. 常见异常测试
+## 9. 动态业务线程池测试
+
+自动化测试：
+
+```bash
+cd ~/AVProject
+python3 tools/thread_pool_concurrency_test.py \
+  192.168.44.130 8000 \
+  --clients 10 --requests 20
+```
+
+确认脚本输出 `failed=0`。如服务端已有 `test.mp4`，可增加 `--download-file test.mp4 --download-blocks 4` 验证并发分片读取。人工回归六类场景：
+
+1. **基础多客户端**：A 上传，B 持续 Ping，C 刷新列表并下载，三者均正常。
+2. **并行文件操作**：A 上传、B 下载、C 扫描列表，日志显示不同 `connectionId` 被不同 worker 执行。
+3. **任务期间断开**：在 A 的业务任务执行时关闭 A，确认 completion 被丢弃，B、C 不受影响。
+4. **续传回归**：分别中断并恢复上传和下载，确认权威 offset、`.part` 与状态文件逻辑不回退。
+5. **关闭服务端**：存在连接和任务时发送 SIGINT/SIGTERM，确认停止接收任务、排空已入队任务、join worker 后退出。
+6. **动态扩缩容**：启动为 4 个核心线程；增加并发业务使线程逐步扩到最多 8 个；任务结束并空闲约 60 秒后恢复到 4 个；再次 Ping、上传和下载仍正常。
+
+队列上限为 256。若通过足够高的并发制造过载，应看到 `task rejected: queue full`，客户端收到 `server busy`，而连接的 in-flight 状态不能永久卡住。
+
+## 10. 常见异常测试
 
 | 场景 | 预期结果 |
 | --- | --- |
@@ -151,8 +178,10 @@ python3 tools/resumable_download_test.py 192.168.44.130 8000 test.mp4 \
 | cache 已有同名文件 | 完整下载后用新文件替换 |
 | 一个客户端发送非法包长 | 只关闭该连接，其他客户端继续工作 |
 | 一个客户端长期不读取响应 | 该连接发送队列达到上限后被关闭 |
+| 业务线程池队列已满 | 当前请求收到 `server busy`，其他连接继续工作 |
+| worker 完成前连接已关闭 | Reactor 按 `connectionId` 丢弃陈旧结果，不向复用 fd 发送 |
 
-## 10. 测试记录建议
+## 11. 测试记录建议
 
 演示或提交前记录：
 

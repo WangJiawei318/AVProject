@@ -20,10 +20,12 @@ class ConnectionContext
 {
 public:
     ConnectionContext(int socketFd,
+                      uint64_t uniqueConnectionId,
                       const std::string &peerAddress,
                       uint16_t peerPort);
 
     int fd;
+    uint64_t connectionId;
     std::string peerIp;
     uint16_t peerPort;
     std::vector<char> receiveBuffer;
@@ -31,6 +33,7 @@ public:
     size_t queuedBytes;
     std::time_t lastActivity;
     bool closing;
+    bool businessTaskInFlight;
 };
 
 #endif // CONNECTIONCONTEXT_H

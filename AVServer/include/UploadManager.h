@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <ctime>
 #include <map>
+#include <mutex>
 #include <string>
 #include <sys/types.h>
 
@@ -16,7 +17,7 @@ public:
     ~UploadManager();
 
     bool initialize();
-    bool createUpload(int ownerFd,
+    bool createUpload(uint64_t ownerConnectionId,
                       const std::string &fileName,
                       const std::string &extension,
                       int64_t fileSize,
@@ -25,7 +26,7 @@ public:
                       int64_t *resumeOffset,
                       std::string *finalFileName,
                       std::string *message);
-    bool resumeUpload(int ownerFd,
+    bool resumeUpload(uint64_t ownerConnectionId,
                       const std::string &transferId,
                       const std::string &resumeToken,
                       const std::string &fileName,
@@ -33,20 +34,20 @@ public:
                       int64_t *resumeOffset,
                       std::string *finalFileName,
                       std::string *message);
-    bool writeBlock(int ownerFd,
+    bool writeBlock(uint64_t ownerConnectionId,
                     const std::string &transferId,
                     int64_t offset,
                     const char *data,
                     int32_t dataSize,
                     int64_t *receivedOffset,
                     std::string *message);
-    bool finishUpload(int ownerFd,
+    bool finishUpload(uint64_t ownerConnectionId,
                       const std::string &transferId,
                       const std::string &fileName,
                       int64_t fileSize,
                       std::string *savedFileName,
                       std::string *message);
-    size_t unbindConnection(int ownerFd);
+    size_t unbindConnection(uint64_t ownerConnectionId);
     size_t cleanupExpiredTasks(std::time_t now);
 
     const std::string &tempDir() const;
@@ -66,7 +67,7 @@ private:
         std::time_t createdTime;
         std::time_t updatedTime;
         std::string status;
-        int activeOwnerFd;
+        uint64_t activeOwnerConnectionId;
     };
 
     bool ensureDirectories();
@@ -95,6 +96,7 @@ private:
                            const std::string &exceptTransferId) const;
     std::string taskPath(const std::string &transferId) const;
     bool secureEquals(const std::string &left, const std::string &right) const;
+    size_t cleanupExpiredTasksUnlocked(std::time_t now);
 
 private:
     enum
@@ -107,6 +109,7 @@ private:
     std::string m_tasksDir;
     std::map<std::string, UploadTask> m_tasks;
     unsigned long m_nextId;
+    mutable std::mutex m_mutex;
 };
 
 #endif // UPLOADMANAGER_H
