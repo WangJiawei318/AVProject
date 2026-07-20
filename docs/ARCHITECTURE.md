@@ -73,7 +73,7 @@ AVClient/ + AVServer/
 | --- | --- | --- |
 | `PlayerPage` | 本地文件、URL 和下载缓存播放 | `PlayerDialog` |
 | `RecorderPage` | 桌面、摄像头、麦克风录制 | `RecorderDialog` |
-| `RemoteMediaPage` | 列表、可恢复上传、下载、进度 | `AVNetworkClient`、`UploadTaskStore` |
+| `RemoteMediaPage` | 列表、可恢复上传/下载、进度 | `AVNetworkClient`、`UploadTaskStore`、`DownloadTaskStore` |
 | `SettingsPage` | IP、端口、连接、断开、Ping | `AVNetworkClient` |
 
 `PlayerPage` 和 `RecorderPage` 是适配层：它们把原来独立窗口形式的 Dialog 嵌入统一客户端。
@@ -291,12 +291,20 @@ socket fd 会在重连后变化，服务端重启后也完全失效，因此不�
 
 ```text
 选择远程文件
-  -> DOWNLOAD_INIT
+  -> DOWNLOAD_INIT(offset=0)
+  -> 保存 size、mtime 和下载任务
   -> 创建 cache/*.part
   -> 循环 DOWNLOAD_BLOCK
+  -> 每块落盘后更新 confirmed_offset
   -> DOWNLOAD_FINISH
   -> .part 改为正式文件
   -> 可选：切换播放页
+
+断线或客户端退出
+  -> 保留 .part 和 transfer_state/*.download.json
+  -> 重连后计算 safe_offset
+  -> DOWNLOAD_INIT(offset=safe_offset, old size, old mtime)
+  -> 从 accepted_offset 继续 DOWNLOAD_BLOCK
 ```
 
 客户端下载进度以“已经校验并写入磁盘的字节数”为准。
@@ -308,13 +316,21 @@ socket fd 会在重连后变化，服务端重启后也完全失效，因此不�
 - 文件名没有路径分隔符和 `..`；
 - 文件位于固定 `media/`；
 - 文件是普通文件且后缀受支持；
+- 恢复时文件大小和修改时间仍与初次 INIT 一致；
+- resume offset 不超过当前文件大小；
 - offset 和 request size 合法。
 
-随后只读取当前请求的最多 64 KB。
+随后只读取当前请求的最多 64 KB。`DownloadManager` 不保存下载任务、token 或文件游标，每个 BLOCK 都按 `filename + offset` 独立读取，因此服务端重启后无需恢复下载内存状态。
 
 ### 10.3 cache 和 .part
 
-下载数据先写入 `AVClient/cache/<name>.part`。全部字节写完且 FINISH 成功后，才替换正式 cache 文件。断线时删除 `.part`，因此播放器不会误打开明显不完整的下载。
+下载数据先写入 `AVClient/cache/<name>.part`。全部字节写完、实际大小正确且 FINISH 成功后，才替换正式 cache 文件。断线时保留 `.part` 供恢复，但播放器仍只打开正式文件名。
+
+### 10.4 DownloadTaskStore 与安全偏移
+
+每个未完成下载保存为 `AVClient/transfer_state/<task_id>.download.json`，包含远程文件名、cache 路径、服务器地址、文件大小、修改时间、确认偏移、是否下载后播放和任务状态。`QSaveFile` 通过临时文件加原子提交更新小型 JSON。
+
+恢复前，客户端用 `min(confirmed_offset, .part 实际大小)` 计算 `safe_offset`。如果 `.part` 更大就截断未确认尾部，如果更小就降低状态偏移。服务端重新校验 size/mtime 后返回 `accepted_offset`，客户端以该值截断、seek 并继续。size/mtime 只能防止常见误拼接，不能识别“内容变化但大小和 mtime 恰好相同”，因此当前仍没有强哈希完整性保证。
 
 ## 11. 页面交互关系
 
@@ -405,7 +421,7 @@ main()
 
 `ProtocolDispatcher` 持有 `MediaManager`、`UploadManager` 和 `DownloadManager`。它接收已经去掉长度头的完整包体，校验具体结构大小，调用业务管理器，再把一个或多个响应包体交还给网络层。这样 `EpollServer` 不理解媒体业务，业务管理器也不依赖 epoll。
 
-上传任务的持久身份是 `transfer_id + resume_token`，`active_owner_fd` 只负责当前会话排他绑定。BLOCK、FINISH 必须来自已绑定连接；连接断开时只解绑，不删除任务。服务端启动时扫描 `temp/tasks/`，按元数据与 `.part` 实际大小的较小值修正安全偏移，并记录缺少元数据的孤立 `.part`。下载继续使用 `filename + offset + request_size` 独立读取，没有跨客户端共享文件游标，多个客户端请求同一文件不会互相改变读取位置。
+上传任务的持久身份是 `transfer_id + resume_token`，`active_owner_fd` 只负责当前会话排他绑定。BLOCK、FINISH 必须来自已绑定连接；连接断开时只解绑，不删除任务。服务端启动时扫描 `temp/tasks/`，按元数据与 `.part` 实际大小的较小值修正安全偏移，并记录缺少元数据的孤立 `.part`。下载继续使用 `filename + offset + request_size` 独立读取，没有跨客户端共享文件游标；恢复时只增加文件 size/mtime 与 requested offset 校验，仍不建立服务端下载任务。
 
 ### 14.5 与 NetDisk-Server 的关系
 
@@ -424,6 +440,8 @@ main()
 | 上传落盘 | temp 后提交 | 不暴露半成品 |
 | 上传恢复身份 | transfer_id + resume_token | fd 变化后仍可恢复，并阻止只猜 ID 的客户端 |
 | 上传状态 | 客户端 JSON + 服务端键值元数据 | 不引入数据库即可跨进程恢复 |
+| 下载恢复状态 | 仅客户端 JSON + `.part` | 服务端按 offset 无状态读取，重启无需恢复任务 |
+| 下载版本判断 | 文件大小 + 修改时间 | 低成本发现常见变化，但不等同于内容哈希 |
 | 下载落盘 | cache `.part` 后改名 | 不播放半成品 |
 | 远程播放 | 完整下载后本地播放 | 复用播放器，不改 AVIO |
 | 页面通信 | signal/slot + MainWindow 中介 | 降低耦合 |
@@ -436,9 +454,9 @@ main()
 - 暂无工作线程池，不能利用多核并行业务处理；
 - 协议使用主机字节序和 packed struct，跨架构能力有限；
 - 没有认证、权限、配额和 TLS；
-- 已支持上传任务文件持久化和断点恢复，但没有下载断点续传；
+- 已支持上传和下载断点续传；上传状态在客户端和服务端持久化，下载状态仅在客户端持久化；
 - 当前 token 不是真正用户权限，且没有 TLS；
-- 只校验大小、偏移和客户端本地修改时间，没有 SHA-256 强内容校验；
+- 只校验大小、偏移和修改时间等元数据，没有 SHA-256 强内容校验；
 - 没有通用取消和自动重试；客户端“放弃任务”只删除本地记录；
 - FINISH 已提交但客户端尚未收到响应时崩溃，可能留下需要人工放弃的本地状态记录；
 - 目录扫描没有分页。
@@ -446,7 +464,7 @@ main()
 建议演进顺序：
 
 1. 为协议增加版本、网络字节序和明确整数编码。
-2. 为下载增加持久任务和断点，并为传输增加通用取消与 SHA-256 校验。
+2. 为传输增加通用取消、稳定文件版本标识与 SHA-256 校验。
 3. 接入有界工作线程池，将磁盘 I/O 与耗时业务结果安全回投 epoll 线程。
 4. 增加用户认证和可选数据库索引。
 5. 最后评估自定义 AVIO、HTTP/HLS 或对象存储。

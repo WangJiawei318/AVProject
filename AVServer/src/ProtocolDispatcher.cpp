@@ -331,17 +331,31 @@ void ProtocolDispatcher::handleDownloadInit(int clientFd,
     std::memcpy(&request, packet.data(), sizeof(request));
     const std::string fileName = boundedString(request.fileName, sizeof(request.fileName));
     std::string message;
-    response.result = m_downloadManager.getFileInfo(fileName,
-                                                     &response.fileSize,
-                                                     &message) ? 1 : 0;
+    response.result = m_downloadManager.initializeDownload(
+                fileName,
+                request.resumeOffset,
+                request.expectedFileSize,
+                request.expectedModifiedTime,
+                &response.fileSize,
+                &response.modifiedTime,
+                &response.acceptedOffset,
+                &message) ? 1 : 0;
     copyText(response.fileName, sizeof(response.fileName), fileName);
     copyText(response.message, sizeof(response.message), message);
     appendStructResponse(response, responses);
-    std::printf("DOWNLOAD_INIT_RQ fd=%d file=%s size=%lld result=%d\n",
+    std::printf("DOWNLOAD_INIT_RQ fd=%d filename=%s requested_offset=%lld result=%d\n",
                 clientFd,
                 fileName.c_str(),
-                static_cast<long long>(response.fileSize),
+                static_cast<long long>(request.resumeOffset),
                 response.result);
+    if (response.result && request.resumeOffset > 0) {
+        std::printf("download resume accepted offset=%lld filename=%s\n",
+                    static_cast<long long>(response.acceptedOffset),
+                    fileName.c_str());
+    } else if (!response.result && message == "remote file changed") {
+        std::printf("download resume rejected: remote file changed filename=%s\n",
+                    fileName.c_str());
+    }
 }
 
 void ProtocolDispatcher::handleDownloadBlock(int clientFd,
@@ -407,6 +421,6 @@ void ProtocolDispatcher::handleDownloadFinish(int clientFd,
     copyText(response.fileName, sizeof(response.fileName), fileName);
     copyText(response.message, sizeof(response.message), message);
     appendStructResponse(response, responses);
-    std::printf("DOWNLOAD_FINISH_RQ fd=%d file=%s result=%d\n",
+    std::printf("download finished fd=%d filename=%s result=%d\n",
                 clientFd, fileName.c_str(), response.result);
 }

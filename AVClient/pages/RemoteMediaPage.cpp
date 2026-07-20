@@ -21,6 +21,7 @@
 #include <QTextEdit>
 #include <QTime>
 #include <QTimer>
+#include <QUuid>
 #include <QVBoxLayout>
 
 RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent)
@@ -35,8 +36,11 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
       m_hasCurrentUploadTask(false),
       m_downloadFile(new QFile(this)),
       m_downloadFileSize(0),
+      m_downloadModifiedTime(0),
       m_downloadOffset(0),
       m_downloading(false),
+      m_resumingDownload(false),
+      m_hasCurrentDownloadTask(false),
       m_playAfterDownload(false)
 {
     auto *root = new QVBoxLayout(this);
@@ -97,6 +101,25 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
     downloadProgressRow->addWidget(m_downloadStatusLabel);
     downloadProgressRow->addWidget(m_downloadProgress, 1);
 
+    m_downloadTaskTable = new QTableWidget(this);
+    m_downloadTaskTable->setColumnCount(6);
+    m_downloadTaskTable->setHorizontalHeaderLabels(
+                QStringList() << "Remote file" << "Downloaded" << "Total"
+                              << "Progress" << "Status" << "Server");
+    m_downloadTaskTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_downloadTaskTable->horizontalHeader()->setStretchLastSection(true);
+    m_downloadTaskTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_downloadTaskTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_downloadTaskTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_downloadTaskTable->setMaximumHeight(135);
+
+    auto *downloadTaskActions = new QHBoxLayout;
+    m_resumeDownloadButton = new QPushButton("Resume download", this);
+    m_abandonDownloadButton = new QPushButton("Abandon task", this);
+    downloadTaskActions->addStretch();
+    downloadTaskActions->addWidget(m_resumeDownloadButton);
+    downloadTaskActions->addWidget(m_abandonDownloadButton);
+
     m_table = new QTableWidget(this);
     m_table->setColumnCount(4);
     m_table->setHorizontalHeaderLabels(QStringList() << "File name" << "Size" << "Modified time" << "Type");
@@ -117,6 +140,9 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
     root->addLayout(uploadTaskActions);
     root->addLayout(downloadActions);
     root->addLayout(downloadProgressRow);
+    root->addWidget(new QLabel("Unfinished downloads", this));
+    root->addWidget(m_downloadTaskTable);
+    root->addLayout(downloadTaskActions);
     root->addWidget(m_table);
     root->addWidget(new QLabel("Remote media log", this));
     root->addWidget(m_logEdit);
@@ -140,6 +166,18 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
             SIGNAL(clicked()),
             this,
             SLOT(slotDownloadAndPlayClicked()));
+    connect(m_resumeDownloadButton,
+            SIGNAL(clicked()),
+            this,
+            SLOT(slotResumeDownloadClicked()));
+    connect(m_abandonDownloadButton,
+            SIGNAL(clicked()),
+            this,
+            SLOT(slotAbandonDownloadClicked()));
+    connect(m_downloadTaskTable,
+            SIGNAL(itemSelectionChanged()),
+            this,
+            SLOT(slotDownloadTaskSelectionChanged()));
     connect(m_table,
             SIGNAL(itemSelectionChanged()),
             this,
@@ -164,9 +202,9 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
             this,
             SLOT(slotUploadFinishResponse(bool,QString,QString)));
     connect(m_networkClient,
-            SIGNAL(downloadInitResponse(bool,QString,qint64,QString)),
+            SIGNAL(downloadInitResponse(bool,QString,qint64,qint64,qint64,QString)),
             this,
-            SLOT(slotDownloadInitResponse(bool,QString,qint64,QString)));
+            SLOT(slotDownloadInitResponse(bool,QString,qint64,qint64,qint64,QString)));
     connect(m_networkClient,
             SIGNAL(downloadBlockResponse(bool,QString,qint64,QByteArray,QString)),
             this,
@@ -178,6 +216,7 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
 
     slotConnectedChanged(m_networkClient->isConnected());
     refreshUploadTaskTable();
+    refreshDownloadTaskTable();
     appendLog("remote media page ready");
 }
 
@@ -521,15 +560,122 @@ void RemoteMediaPage::slotDownloadAndPlayClicked()
     startDownload(true);
 }
 
+void RemoteMediaPage::slotDownloadTaskSelectionChanged()
+{
+    updateActionStates();
+}
+
+void RemoteMediaPage::slotResumeDownloadClicked()
+{
+    if (m_uploading || m_downloading)
+        return;
+
+    DownloadTaskState task;
+    if (!selectedDownloadTask(&task)) {
+        QMessageBox::information(this, "Resume download",
+                                 "Please select an unfinished download task.");
+        return;
+    }
+    if (!m_networkClient->isConnected()) {
+        QMessageBox::information(this, "Resume download",
+                                 QString("Connect to %1:%2 first.")
+                                 .arg(task.serverIp)
+                                 .arg(task.serverPort));
+        return;
+    }
+    if (m_networkClient->serverIp() != task.serverIp ||
+            m_networkClient->serverPort() != task.serverPort) {
+        QMessageBox::warning(this, "Resume download",
+                             QString("This task belongs to %1:%2.")
+                             .arg(task.serverIp)
+                             .arg(task.serverPort));
+        return;
+    }
+
+    QString error;
+    if (!prepareSafeDownloadOffset(&task, &error)) {
+        QMessageBox::warning(this, "Resume download", error);
+        refreshDownloadTaskTable();
+        return;
+    }
+
+    m_downloading = true;
+    m_resumingDownload = true;
+    m_hasCurrentDownloadTask = true;
+    m_currentDownloadTask = task;
+    m_playAfterDownload = task.playAfterDownload;
+    m_downloadFileName = task.remoteFileName;
+    m_downloadPartPath = task.localPartPath;
+    m_downloadFinalPath = task.localFinalPath;
+    m_downloadFileSize = task.expectedFileSize;
+    m_downloadModifiedTime = task.expectedModifiedTime;
+    m_downloadOffset = task.confirmedOffset;
+    m_downloadProgress->setValue(
+                static_cast<int>((m_downloadOffset * 100) / m_downloadFileSize));
+    m_downloadStatusLabel->setText(QString("Resuming %1").arg(m_downloadFileName));
+    updateActionStates();
+    appendLog(QString("requesting download resume at %1 bytes: %2")
+              .arg(m_downloadOffset)
+              .arg(m_downloadFileName));
+
+    if (!m_networkClient->sendDownloadInit(m_downloadFileName,
+                                           m_downloadOffset,
+                                           m_downloadFileSize,
+                                           m_downloadModifiedTime)) {
+        finishDownloadState(false, "failed to send download resume request");
+    }
+}
+
+void RemoteMediaPage::slotAbandonDownloadClicked()
+{
+    DownloadTaskState task;
+    if (!selectedDownloadTask(&task)) {
+        QMessageBox::information(this, "Abandon download",
+                                 "Please select an unfinished download task.");
+        return;
+    }
+    if (QMessageBox::question(this,
+                              "Abandon download",
+                              QString("Remove the recovery record and partial file for %1?")
+                              .arg(task.remoteFileName)) != QMessageBox::Yes) {
+        return;
+    }
+
+    if (QFileInfo::exists(task.localPartPath) && !QFile::remove(task.localPartPath)) {
+        QMessageBox::warning(this, "Abandon download",
+                             "Cannot remove the local partial file.");
+        return;
+    }
+    QString error;
+    if (!m_downloadTaskStore.remove(task.taskId, &error)) {
+        QMessageBox::warning(this, "Abandon download", error);
+        return;
+    }
+    appendLog(QString("local download task abandoned: %1")
+              .arg(task.remoteFileName));
+    refreshDownloadTaskTable();
+}
+
 void RemoteMediaPage::slotDownloadInitResponse(bool success,
                                                const QString &fileName,
                                                qint64 fileSize,
+                                               qint64 modifiedTime,
+                                               qint64 acceptedOffset,
                                                const QString &message)
 {
     if (!m_downloading)
         return;
-    if (!success || fileName != m_downloadFileName || fileSize <= 0) {
-        finishDownloadState(false, QString("download initialization failed: %1").arg(message));
+    if (!success) {
+        finishDownloadState(false,
+                            QString("download initialization failed: %1").arg(message),
+                            message == "remote file changed"
+                            ? "remote file changed" : "waiting");
+        return;
+    }
+    if (fileName != m_downloadFileName || fileSize <= 0 ||
+            modifiedTime <= 0 || acceptedOffset < 0 ||
+            acceptedOffset > fileSize) {
+        finishDownloadState(false, "server returned invalid download metadata");
         return;
     }
     if (!isSafeCacheFileName(fileName)) {
@@ -544,23 +690,79 @@ void RemoteMediaPage::slotDownloadInitResponse(bool success,
         return;
     }
 
-    m_downloadFileSize = fileSize;
-    m_downloadFinalPath = QDir(cacheDir).filePath(fileName);
-    m_downloadPartPath = m_downloadFinalPath + ".part";
-    QFile::remove(m_downloadPartPath);
-    m_downloadFile->setFileName(m_downloadPartPath);
-    if (!m_downloadFile->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        finishDownloadState(false,
-                            QString("failed to create cache file: %1")
-                            .arg(m_downloadFile->errorString()));
-        return;
+    if (m_resumingDownload) {
+        if (!m_hasCurrentDownloadTask ||
+                fileSize != m_currentDownloadTask.expectedFileSize ||
+                modifiedTime != m_currentDownloadTask.expectedModifiedTime ||
+                acceptedOffset > QFileInfo(m_downloadPartPath).size()) {
+            finishDownloadState(false, "download resume metadata mismatch");
+            return;
+        }
+
+        m_downloadFile->setFileName(m_downloadPartPath);
+        if (!m_downloadFile->open(QIODevice::ReadWrite) ||
+                !m_downloadFile->resize(acceptedOffset) ||
+                !m_downloadFile->seek(acceptedOffset)) {
+            finishDownloadState(false,
+                                QString("failed to open partial download: %1")
+                                .arg(m_downloadFile->errorString()));
+            return;
+        }
+        m_downloadOffset = acceptedOffset;
+        m_currentDownloadTask.confirmedOffset = acceptedOffset;
+        if (!saveCurrentDownloadTask("downloading")) {
+            finishDownloadState(false, "failed to update local download state");
+            return;
+        }
+        appendLog(QString("download resumed at %1 bytes").arg(acceptedOffset));
+    } else {
+        if (acceptedOffset != 0) {
+            finishDownloadState(false, "new download returned non-zero offset");
+            return;
+        }
+
+        m_downloadFileSize = fileSize;
+        m_downloadModifiedTime = modifiedTime;
+        m_downloadFinalPath = QDir(cacheDir).filePath(fileName);
+        m_downloadPartPath = m_downloadFinalPath + ".part";
+        QFile::remove(m_downloadPartPath);
+        m_downloadFile->setFileName(m_downloadPartPath);
+        if (!m_downloadFile->open(QIODevice::ReadWrite | QIODevice::Truncate)) {
+            finishDownloadState(false,
+                                QString("failed to create cache file: %1")
+                                .arg(m_downloadFile->errorString()));
+            return;
+        }
+
+        m_currentDownloadTask = DownloadTaskState();
+        m_currentDownloadTask.taskId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        m_currentDownloadTask.remoteFileName = fileName;
+        m_currentDownloadTask.localPartPath = m_downloadPartPath;
+        m_currentDownloadTask.localFinalPath = m_downloadFinalPath;
+        m_currentDownloadTask.serverIp = m_networkClient->serverIp();
+        m_currentDownloadTask.serverPort = m_networkClient->serverPort();
+        m_currentDownloadTask.expectedFileSize = fileSize;
+        m_currentDownloadTask.expectedModifiedTime = modifiedTime;
+        m_currentDownloadTask.confirmedOffset = 0;
+        m_currentDownloadTask.playAfterDownload = m_playAfterDownload;
+        m_hasCurrentDownloadTask = true;
+        if (!saveCurrentDownloadTask("downloading")) {
+            m_downloadFile->close();
+            QFile::remove(m_downloadPartPath);
+            m_hasCurrentDownloadTask = false;
+            finishDownloadState(false, "failed to save local download state");
+            return;
+        }
+        appendLog(QString("download initialized: %1 bytes, mtime=%2")
+                  .arg(fileSize)
+                  .arg(modifiedTime));
     }
 
     m_downloadStatusLabel->setText(QString("Downloading %1").arg(fileName));
-    appendLog(QString("download initialized: %1 bytes").arg(fileSize));
-    QTimer::singleShot(0, this, [this]() {
-        requestNextDownloadBlock();
-    });
+    m_downloadProgress->setValue(
+                static_cast<int>((m_downloadOffset * 100) / m_downloadFileSize));
+    refreshDownloadTaskTable();
+    continueDownloadAfterInitialization();
 }
 
 void RemoteMediaPage::slotDownloadBlockResponse(bool success,
@@ -579,20 +781,28 @@ void RemoteMediaPage::slotDownloadBlockResponse(bool success,
             offset != m_downloadOffset ||
             data.isEmpty() ||
             data.size() > 64 * 1024 ||
-            m_downloadOffset + data.size() > m_downloadFileSize) {
+            m_downloadOffset < 0 ||
+            m_downloadOffset > m_downloadFileSize ||
+            data.size() > m_downloadFileSize - m_downloadOffset) {
         finishDownloadState(false, "server returned an invalid download block");
         return;
     }
 
-    if (m_downloadFile->write(data) != data.size()) {
+    if (m_downloadFile->write(data) != data.size() || !m_downloadFile->flush()) {
         finishDownloadState(false,
                             QString("failed to write cache file: %1")
                             .arg(m_downloadFile->errorString()));
         return;
     }
     m_downloadOffset += data.size();
+    m_currentDownloadTask.confirmedOffset = m_downloadOffset;
+    if (!saveCurrentDownloadTask("downloading")) {
+        finishDownloadState(false, "failed to persist download progress");
+        return;
+    }
     m_downloadProgress->setValue(
                 static_cast<int>((m_downloadOffset * 100) / m_downloadFileSize));
+    refreshDownloadTaskTable();
 
     if (m_downloadOffset == m_downloadFileSize) {
         m_downloadFile->flush();
@@ -872,11 +1082,21 @@ void RemoteMediaPage::startDownload(bool playAfterDownload)
                                  "Please select a remote media file first.");
         return;
     }
+    if (hasConflictingDownloadTask(fileName)) {
+        QMessageBox::information(this,
+                                 "Download media",
+                                 "An unfinished download already uses this cache file. "
+                                 "Resume or abandon that task first.");
+        return;
+    }
 
     m_downloading = true;
+    m_resumingDownload = false;
+    m_hasCurrentDownloadTask = false;
     m_playAfterDownload = playAfterDownload;
     m_downloadFileName = fileName;
     m_downloadFileSize = 0;
+    m_downloadModifiedTime = 0;
     m_downloadOffset = 0;
     m_downloadPartPath.clear();
     m_downloadFinalPath.clear();
@@ -885,8 +1105,28 @@ void RemoteMediaPage::startDownload(bool playAfterDownload)
     updateActionStates();
     appendLog(QString("starting download: %1").arg(fileName));
 
-    if (!m_networkClient->sendDownloadInit(fileName))
+    if (!m_networkClient->sendDownloadInit(fileName, 0, 0, 0))
         finishDownloadState(false, "failed to send download initialization");
+}
+
+void RemoteMediaPage::continueDownloadAfterInitialization()
+{
+    if (!m_downloading)
+        return;
+    if (m_downloadOffset == m_downloadFileSize) {
+        if (m_downloadFile->isOpen())
+            m_downloadFile->close();
+        m_downloadStatusLabel->setText(QString("Finalizing %1").arg(m_downloadFileName));
+        if (!m_networkClient->sendDownloadFinish(m_downloadFileName,
+                                                 m_downloadFileSize)) {
+            finishDownloadState(false, "failed to send download completion request");
+        }
+        return;
+    }
+
+    QTimer::singleShot(0, this, [this]() {
+        requestNextDownloadBlock();
+    });
 }
 
 void RemoteMediaPage::requestNextDownloadBlock()
@@ -908,25 +1148,182 @@ void RemoteMediaPage::requestNextDownloadBlock()
     }
 }
 
-void RemoteMediaPage::finishDownloadState(bool success, const QString &message)
+void RemoteMediaPage::finishDownloadState(bool success,
+                                          const QString &message,
+                                          const QString &failureStatus)
 {
     if (m_downloadFile->isOpen())
         m_downloadFile->close();
-    if (!success && !m_downloadPartPath.isEmpty())
-        QFile::remove(m_downloadPartPath);
+
+    if (m_hasCurrentDownloadTask) {
+        QString error;
+        if (success) {
+            if (!m_downloadTaskStore.remove(m_currentDownloadTask.taskId, &error)) {
+                appendLog(QString("warning: failed to remove local download task: %1")
+                          .arg(error));
+            }
+        } else if (!saveCurrentDownloadTask(failureStatus)) {
+            appendLog("warning: failed to preserve local download recovery state");
+        }
+    }
 
     m_downloading = false;
+    m_resumingDownload = false;
+    m_hasCurrentDownloadTask = false;
     m_playAfterDownload = false;
+    m_currentDownloadTask = DownloadTaskState();
     m_downloadFileName.clear();
     m_downloadPartPath.clear();
     m_downloadFinalPath.clear();
     m_downloadFileSize = 0;
+    m_downloadModifiedTime = 0;
     m_downloadOffset = 0;
     m_downloadStatusLabel->setText(success ? "Download completed" : "Download stopped");
     if (success)
         m_downloadProgress->setValue(100);
     appendLog(message);
+    refreshDownloadTaskTable();
     updateActionStates();
+}
+
+bool RemoteMediaPage::saveCurrentDownloadTask(const QString &status)
+{
+    if (!m_hasCurrentDownloadTask || m_currentDownloadTask.taskId.isEmpty())
+        return false;
+    m_currentDownloadTask.confirmedOffset = m_downloadOffset;
+    m_currentDownloadTask.playAfterDownload = m_playAfterDownload;
+    m_currentDownloadTask.status = status;
+    QString error;
+    if (!m_downloadTaskStore.save(m_currentDownloadTask, &error)) {
+        appendLog(QString("failed to save local download task: %1").arg(error));
+        return false;
+    }
+    return true;
+}
+
+void RemoteMediaPage::refreshDownloadTaskTable()
+{
+    const QSignalBlocker blocker(m_downloadTaskTable);
+    const QString selectedId = m_downloadTaskTable->currentRow() >= 0 &&
+            m_downloadTaskTable->item(m_downloadTaskTable->currentRow(), 0)
+            ? m_downloadTaskTable->item(m_downloadTaskTable->currentRow(), 0)
+              ->data(Qt::UserRole).toString()
+            : QString();
+
+    QStringList warnings;
+    const QList<DownloadTaskState> tasks = m_downloadTaskStore.loadAll(&warnings);
+    m_downloadTaskTable->setRowCount(0);
+    int selectedRow = -1;
+    for (const DownloadTaskState &task : tasks) {
+        const qint64 partSize = QFileInfo(task.localPartPath).exists()
+                ? QFileInfo(task.localPartPath).size() : 0;
+        const qint64 safeOffset = qMin(task.confirmedOffset, partSize);
+        const int progress = static_cast<int>((safeOffset * 100) /
+                                              task.expectedFileSize);
+        const int row = m_downloadTaskTable->rowCount();
+        m_downloadTaskTable->insertRow(row);
+        QTableWidgetItem *nameItem = new QTableWidgetItem(task.remoteFileName);
+        nameItem->setData(Qt::UserRole, task.taskId);
+        m_downloadTaskTable->setItem(row, 0, nameItem);
+        m_downloadTaskTable->setItem(row, 1,
+                                     new QTableWidgetItem(QString::number(safeOffset)));
+        m_downloadTaskTable->setItem(row, 2,
+                                     new QTableWidgetItem(QString::number(task.expectedFileSize)));
+        m_downloadTaskTable->setItem(row, 3,
+                                     new QTableWidgetItem(QString("%1%").arg(progress)));
+        m_downloadTaskTable->setItem(row, 4,
+                                     new QTableWidgetItem(localDownloadTaskStatus(task)));
+        m_downloadTaskTable->setItem(row, 5,
+                                     new QTableWidgetItem(QString("%1:%2")
+                                                          .arg(task.serverIp)
+                                                          .arg(task.serverPort)));
+        if (task.taskId == selectedId)
+            selectedRow = row;
+    }
+    if (selectedRow >= 0)
+        m_downloadTaskTable->selectRow(selectedRow);
+    for (const QString &warning : warnings)
+        appendLog(QString("download task warning: %1").arg(warning));
+    updateActionStates();
+}
+
+bool RemoteMediaPage::selectedDownloadTask(DownloadTaskState *task) const
+{
+    if (!task)
+        return false;
+    const int row = m_downloadTaskTable->currentRow();
+    QTableWidgetItem *item = row >= 0 ? m_downloadTaskTable->item(row, 0) : nullptr;
+    if (!item)
+        return false;
+    const QString taskId = item->data(Qt::UserRole).toString();
+    const QList<DownloadTaskState> tasks = m_downloadTaskStore.loadAll();
+    for (const DownloadTaskState &candidate : tasks) {
+        if (candidate.taskId == taskId) {
+            *task = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+QString RemoteMediaPage::localDownloadTaskStatus(const DownloadTaskState &task) const
+{
+    const QFileInfo partInfo(task.localPartPath);
+    if (!partInfo.exists() || !partInfo.isFile())
+        return "Partial file missing";
+    if (m_downloading && m_hasCurrentDownloadTask &&
+            task.taskId == m_currentDownloadTask.taskId) {
+        return m_resumingDownload ? "Resuming" : "Downloading";
+    }
+    return task.status == "downloading" || task.status == "waiting"
+            ? "Waiting to resume" : task.status;
+}
+
+bool RemoteMediaPage::prepareSafeDownloadOffset(DownloadTaskState *task,
+                                                QString *error)
+{
+    if (!task || !error)
+        return false;
+    QFile partFile(task->localPartPath);
+    if (!partFile.exists()) {
+        *error = "The local partial file is missing.";
+        return false;
+    }
+    if (!partFile.open(QIODevice::ReadWrite)) {
+        *error = QString("Cannot open the local partial file: %1")
+                .arg(partFile.errorString());
+        return false;
+    }
+
+    const qint64 actualSize = partFile.size();
+    const qint64 safeOffset = qMin(task->confirmedOffset, actualSize);
+    if (actualSize > safeOffset && !partFile.resize(safeOffset)) {
+        *error = QString("Cannot truncate the local partial file: %1")
+                .arg(partFile.errorString());
+        return false;
+    }
+    partFile.close();
+
+    if (safeOffset != task->confirmedOffset) {
+        task->confirmedOffset = safeOffset;
+        task->status = "waiting";
+        if (!m_downloadTaskStore.save(*task, error))
+            return false;
+    }
+    return true;
+}
+
+bool RemoteMediaPage::hasConflictingDownloadTask(const QString &fileName) const
+{
+    const QString cacheDir = QDir::cleanPath(
+                QCoreApplication::applicationDirPath() + "/../cache");
+    const QString partPath = QDir(cacheDir).filePath(fileName) + ".part";
+    const QList<DownloadTaskState> tasks = m_downloadTaskStore.loadAll();
+    for (const DownloadTaskState &task : tasks) {
+        if (QDir::cleanPath(task.localPartPath) == QDir::cleanPath(partPath))
+            return true;
+    }
+    return false;
 }
 
 QString RemoteMediaPage::selectedMediaFile() const
@@ -958,4 +1355,7 @@ void RemoteMediaPage::updateActionStates()
     const bool uploadTaskSelected = m_uploadTaskTable->currentRow() >= 0;
     m_resumeUploadButton->setEnabled(uploadTaskSelected && !transferBusy);
     m_abandonUploadButton->setEnabled(uploadTaskSelected && !transferBusy);
+    const bool downloadTaskSelected = m_downloadTaskTable->currentRow() >= 0;
+    m_resumeDownloadButton->setEnabled(downloadTaskSelected && !transferBusy);
+    m_abandonDownloadButton->setEnabled(downloadTaskSelected && !transferBusy);
 }

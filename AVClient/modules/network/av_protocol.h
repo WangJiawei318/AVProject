@@ -260,13 +260,19 @@ struct STRU_UPLOAD_FINISH_RS
 struct STRU_DOWNLOAD_INIT_RQ
 {
     STRU_DOWNLOAD_INIT_RQ()
-        : type(DEF_PACK_DOWNLOAD_INIT_RQ)
+        : type(DEF_PACK_DOWNLOAD_INIT_RQ),
+          resumeOffset(0),
+          expectedFileSize(0),
+          expectedModifiedTime(0)
     {
         memset(fileName, 0, sizeof(fileName));
     }
 
     PackType type;
     char fileName[AV_FILE_NAME_SIZE];
+    int64_t resumeOffset;
+    int64_t expectedFileSize;
+    int64_t expectedModifiedTime;
 };
 
 struct STRU_DOWNLOAD_INIT_RS
@@ -274,7 +280,9 @@ struct STRU_DOWNLOAD_INIT_RS
     STRU_DOWNLOAD_INIT_RS()
         : type(DEF_PACK_DOWNLOAD_INIT_RS),
           result(0),
-          fileSize(0)
+          fileSize(0),
+          modifiedTime(0),
+          acceptedOffset(0)
     {
         memset(fileName, 0, sizeof(fileName));
         memset(message, 0, sizeof(message));
@@ -284,6 +292,8 @@ struct STRU_DOWNLOAD_INIT_RS
     int32_t result;
     char fileName[AV_FILE_NAME_SIZE];
     int64_t fileSize;
+    int64_t modifiedTime;
+    int64_t acceptedOffset;
     char message[AV_TEXT_SIZE];
 };
 

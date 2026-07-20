@@ -19,6 +19,7 @@ SOURCES += \
     pages/RemoteMediaPage.cpp \
     pages/SettingsPage.cpp \
     modules/network/AVNetworkClient.cpp \
+    modules/network/DownloadTaskStore.cpp \
     modules/network/UploadTaskStore.cpp \
     modules/network/TcpClient.cpp \
     modules/player/PacketQueue.cpp \
@@ -38,6 +39,7 @@ HEADERS += \
     pages/RemoteMediaPage.h \
     pages/SettingsPage.h \
     modules/network/AVNetworkClient.h \
+    modules/network/DownloadTaskStore.h \
     modules/network/UploadTaskStore.h \
     modules/network/TcpClient.h \
     modules/network/av_protocol.h \

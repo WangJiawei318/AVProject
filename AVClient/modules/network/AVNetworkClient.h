@@ -33,7 +33,10 @@ public:
     bool sendUploadFinish(const QString &transferId,
                           const QString &fileName,
                           qint64 fileSize);
-    bool sendDownloadInit(const QString &fileName);
+    bool sendDownloadInit(const QString &fileName,
+                          qint64 resumeOffset = 0,
+                          qint64 expectedFileSize = 0,
+                          qint64 expectedModifiedTime = 0);
     bool sendDownloadBlock(const QString &fileName,
                            qint64 offset,
                            int requestSize);
@@ -69,6 +72,8 @@ signals:
     void downloadInitResponse(bool success,
                               const QString &fileName,
                               qint64 fileSize,
+                              qint64 modifiedTime,
+                              qint64 acceptedOffset,
                               const QString &message);
     void downloadBlockResponse(bool success,
                                const QString &fileName,

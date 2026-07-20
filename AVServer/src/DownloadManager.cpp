@@ -16,11 +16,59 @@ DownloadManager::DownloadManager(const std::string &mediaDir)
 {
 }
 
+bool DownloadManager::initializeDownload(const std::string &fileName,
+                                         int64_t requestedOffset,
+                                         int64_t expectedFileSize,
+                                         int64_t expectedModifiedTime,
+                                         int64_t *fileSize,
+                                         int64_t *modifiedTime,
+                                         int64_t *acceptedOffset,
+                                         std::string *message) const
+{
+    if (!fileSize || !modifiedTime || !acceptedOffset || !message)
+        return false;
+    *fileSize = 0;
+    *modifiedTime = 0;
+    *acceptedOffset = 0;
+
+    if (!getFileInfo(fileName, fileSize, modifiedTime, message))
+        return false;
+    if (requestedOffset < 0 || requestedOffset > *fileSize) {
+        *message = "invalid download resume offset";
+        return false;
+    }
+
+    if (expectedFileSize == 0) {
+        if (requestedOffset != 0 || expectedModifiedTime != 0) {
+            *message = "invalid new download metadata";
+            return false;
+        }
+        *acceptedOffset = 0;
+        *message = "download initialized";
+        return true;
+    }
+
+    if (expectedFileSize < 0 || expectedModifiedTime <= 0) {
+        *message = "invalid download resume metadata";
+        return false;
+    }
+    if (*fileSize != expectedFileSize ||
+            *modifiedTime != expectedModifiedTime) {
+        *message = "remote file changed";
+        return false;
+    }
+
+    *acceptedOffset = requestedOffset;
+    *message = "download resume accepted";
+    return true;
+}
+
 bool DownloadManager::getFileInfo(const std::string &fileName,
                                   int64_t *fileSize,
+                                  int64_t *modifiedTime,
                                   std::string *message) const
 {
-    if (!fileSize || !message)
+    if (!fileSize || !modifiedTime || !message)
         return false;
     if (!isSafeFileName(fileName) || !isSupportedMediaFile(fileName)) {
         *message = "invalid media file name";
@@ -38,6 +86,7 @@ bool DownloadManager::getFileInfo(const std::string &fileName,
     }
 
     *fileSize = static_cast<int64_t>(st.st_size);
+    *modifiedTime = static_cast<int64_t>(st.st_mtime);
     *message = "download initialized";
     return true;
 }
@@ -52,7 +101,8 @@ bool DownloadManager::readBlock(const std::string &fileName,
         return false;
 
     int64_t fileSize = 0;
-    if (!getFileInfo(fileName, &fileSize, message))
+    int64_t modifiedTime = 0;
+    if (!getFileInfo(fileName, &fileSize, &modifiedTime, message))
         return false;
     if (offset < 0 || offset >= fileSize) {
         *message = "invalid download offset";
@@ -97,7 +147,8 @@ bool DownloadManager::validateCompletion(const std::string &fileName,
                                          std::string *message) const
 {
     int64_t currentSize = 0;
-    if (!getFileInfo(fileName, &currentSize, message))
+    int64_t modifiedTime = 0;
+    if (!getFileInfo(fileName, &currentSize, &modifiedTime, message))
         return false;
     if (currentSize != fileSize) {
         *message = "download file size does not match";

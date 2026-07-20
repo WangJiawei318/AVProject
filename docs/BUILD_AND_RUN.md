@@ -185,7 +185,8 @@ AVClient/
 │   ├── platforms/
 │   └── recordings/       # 默认录制输出
 ├── cache/                # 下载完成的媒体
-├── transfer_state/       # 未完成上传任务 JSON
+│   └── *.part            # 可恢复下载半成品
+├── transfer_state/       # 未完成上传/下载任务 JSON
 └── build-debug/          # 编译中间文件
 ```
 
@@ -258,7 +259,7 @@ AVServer/AVServer
 ./AVServer
 ```
 
-阶段 8 启动后应看到类似日志：
+阶段 9 启动后应看到类似日志：
 
 ```text
 media directory: media
@@ -347,7 +348,7 @@ Windows 测试 TCP：
 Test-NetConnection 192.168.44.130 -Port 8000
 ```
 
-## 12. 并发测试工具
+## 12. 自动化测试工具
 
 `tools/concurrent_client_test.py` 只使用 Python 标准库。它会建立多个同步起跑的连接，每个连接重复发送 Ping，也可额外校验媒体列表：
 
@@ -373,6 +374,16 @@ python3 tools/resumable_upload_test.py 192.168.44.130 8000 \
 python3 tools/resumable_upload_test.py 127.0.0.1 8000 \
   --server-media-dir ./AVServer/media
 ```
+
+下载断点续传工具使用指定的远程媒体文件：
+
+```bash
+cd ~/AVProject
+python3 tools/resumable_download_test.py 192.168.44.130 8000 test.mp4 \
+  --blocks-before-disconnect 4 --output-dir ./download-test
+```
+
+它会下载若干 64 KB 分片后主动断线，把 `.part` 和 JSON 状态写入输出目录，再以非零 offset 重连并完成下载。脚本验证 accepted offset 和最终文件大小，不播放文件。下载恢复不需要服务端任务目录；AVServer 仅重新检查远程文件大小、修改时间和请求偏移。
 
 ## 13. 推荐启动顺序
 

@@ -10,8 +10,17 @@ class DownloadManager
 public:
     explicit DownloadManager(const std::string &mediaDir = "media");
 
+    bool initializeDownload(const std::string &fileName,
+                            int64_t requestedOffset,
+                            int64_t expectedFileSize,
+                            int64_t expectedModifiedTime,
+                            int64_t *fileSize,
+                            int64_t *modifiedTime,
+                            int64_t *acceptedOffset,
+                            std::string *message) const;
     bool getFileInfo(const std::string &fileName,
                      int64_t *fileSize,
+                     int64_t *modifiedTime,
                      std::string *message) const;
     bool readBlock(const std::string &fileName,
                    int64_t offset,

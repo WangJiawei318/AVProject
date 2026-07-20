@@ -415,9 +415,12 @@ Completed 或 Failed
 ```text
 type: int32
 fileName: char[256]
+resumeOffset: int64
+expectedFileSize: int64
+expectedModifiedTime: int64
 ```
 
-服务端不接受路径，只在固定 `media/` 中查找经过验证的普通媒体文件。
+新下载把后三个字段置为 0。恢复下载携带客户端计算出的安全偏移，以及第一次 INIT 保存的文件大小和修改时间。服务端不接受路径，只在固定 `media/` 中查找经过验证的普通媒体文件。
 
 ### 12.3 DOWNLOAD_INIT_RS
 
@@ -426,8 +429,17 @@ type: int32
 result: int32
 fileName: char[256]
 fileSize: int64
+modifiedTime: int64
+acceptedOffset: int64
 message: char[128]
 ```
+
+服务端处理规则：
+
+- 新下载：返回当前 size、mtime，`acceptedOffset = 0`；
+- 恢复下载：要求当前 size/mtime 与客户端保存值完全一致，且 `resumeOffset <= fileSize`；
+- 版本一致：`acceptedOffset = resumeOffset`；
+- 版本不一致：返回 `remote file changed`，不允许客户端把新旧内容拼接。
 
 客户端用 `fileSize` 建立进度范围，并创建：
 
@@ -444,7 +456,7 @@ offset: int64
 requestSize: int32
 ```
 
-客户端从 offset 0 开始，每次最多请求 64 KB。最后一块请求剩余字节数。
+客户端从 INIT 响应中的 accepted offset 开始，每次最多请求 64 KB。最后一块请求剩余字节数。
 
 ### 12.5 DOWNLOAD_BLOCK_RS
 
@@ -541,6 +553,8 @@ message: char[128]
 - 同一上传任务的活动连接排他绑定；
 - 服务端重启时按元数据和 `.part` 实际大小确定安全偏移；
 - 72 小时上传任务过期清理。
+- 下载恢复时校验远程文件大小、修改时间和 resume offset；
+- 客户端按状态 offset 与 `.part` 实际大小的较小值恢复。
 
 当前没有：
 
@@ -559,15 +573,15 @@ message: char[128]
 3. 使用主机字节序，不是标准网络字节序。
 4. 没有协议版本号和能力协商。
 5. 没有 request_id，多个并发请求难以关联。
-6. 上传有 transfer ID 和恢复 token，下载仍没有持久任务 ID。
+6. 上传有 transfer ID 和恢复 token；下载刻意保持服务端无状态，没有持久任务 ID。
 7. 错误码只有 result 和字符串，无法程序化分类。
 8. 列表是分隔文本，没有转义协议、分页和总数。
 9. 串行 ACK 简单但高 RTT 下吞吐较低。
 10. 没有哈希，等长内容损坏无法发现。
-11. 上传已支持任务恢复和过期清理，但下载没有断点恢复，也没有通用取消和自动重试。
+11. 上传和下载已支持手动任务恢复，但没有通用取消和自动重试。
 12. 最大包长、块大小等能力没有协商。
 
-## 18. 当前上传断点续传与下载扩展方向
+## 18. 当前上传与下载断点续传
 
 上传断点续传已经实现：
 
@@ -581,12 +595,16 @@ message: char[128]
 
 安全边界：当前 token 来自 `/dev/urandom`，失败才回退 `std::random_device`；它能阻止只猜 transfer ID 的客户端，但未经过 TLS 保护，也没有绑定真实用户身份。当前文件一致性依赖文件名、大小、客户端 mtime、连续偏移和 `.part` 大小，不能识别“内容变化但大小和修改时间碰巧一致”的情况。
 
-下载恢复仍未实现，后续可按以下流程扩展：
+下载断点续传也已实现，但采用不同模型：
 
-1. 客户端保留 `.part` 和元数据。
-2. INIT 携带本地大小和服务端文件版本。
-3. 服务端确认同一文件版本后返回恢复位置。
-4. 若版本不同，删除旧 `.part` 从零开始。
+1. 客户端用 JSON 保存服务器地址、远程文件名、size/mtime、确认 offset 和播放意图，并保留 cache `.part`。
+2. 恢复前取 `min(confirmedOffset, partFileSize)`；多余尾部截断，文件较小时降低状态偏移。
+3. 扩展后的 DOWNLOAD_INIT 携带 safe offset 和上次文件版本。
+4. 服务端重新 stat 正式媒体，版本一致时返回 accepted offset；版本变化时明确返回 `remote file changed`。
+5. 服务端不创建下载任务、download ID、token 或持久化元数据；AVServer 重启后可直接按 offset 恢复。
+6. 每块成功写入后客户端原子更新状态，完成并改名后删除状态。
+
+下载使用 size/mtime 只是一种低成本版本判断。它不能发现“内容已变化，但大小和修改时间恰好相同”的情况，也没有传输后 SHA-256 校验。当前上传 token 也只是一种任务恢复凭据，不是真实用户权限。
 
 ## 19. 如何扩展 MD5/SHA-256 校验
 

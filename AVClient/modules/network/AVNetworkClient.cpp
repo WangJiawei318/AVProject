@@ -171,13 +171,19 @@ bool AVNetworkClient::sendUploadFinish(const QString &transferId,
     return ok;
 }
 
-bool AVNetworkClient::sendDownloadInit(const QString &fileName)
+bool AVNetworkClient::sendDownloadInit(const QString &fileName,
+                                       qint64 resumeOffset,
+                                       qint64 expectedFileSize,
+                                       qint64 expectedModifiedTime)
 {
     STRU_DOWNLOAD_INIT_RQ rq;
     if (!copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
         emit logMessage("failed to send DOWNLOAD_INIT_RQ: file name is too long");
         return false;
     }
+    rq.resumeOffset = resumeOffset;
+    rq.expectedFileSize = expectedFileSize;
+    rq.expectedModifiedTime = expectedModifiedTime;
 
     const bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
     emit logMessage(ok ? "sent DOWNLOAD_INIT_RQ" : "failed to send DOWNLOAD_INIT_RQ");
@@ -388,6 +394,8 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
             emit downloadInitResponse(false,
                                       QString(),
                                       0,
+                                      0,
+                                      0,
                                       "invalid DOWNLOAD_INIT_RS");
             return;
         }
@@ -396,7 +404,12 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         const QString fileName = utf8Field(rs.fileName, sizeof(rs.fileName));
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         emit logMessage(QString("received DOWNLOAD_INIT_RS: %1").arg(message));
-        emit downloadInitResponse(rs.result != 0, fileName, rs.fileSize, message);
+        emit downloadInitResponse(rs.result != 0,
+                                  fileName,
+                                  rs.fileSize,
+                                  rs.modifiedTime,
+                                  rs.acceptedOffset,
+                                  message);
         break;
     }
     case DEF_PACK_DOWNLOAD_BLOCK_RS:

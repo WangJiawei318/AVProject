@@ -44,6 +44,8 @@ AVProject 是一个面向音视频学习与工程整合的 C++ 客户端/服务�
 - 上传断点续传，以及 AVClient/AVServer 重启后的任务恢复。
 - 未完成上传任务列表、手动恢复和本地放弃记录。
 - 64 KB 串行分片下载与进度显示。
+- 下载断点续传，以及网络断开、AVClient/AVServer 重启后的手动恢复。
+- 未完成下载任务列表、客户端状态持久化和放弃任务清理。
 - 下载到 `AVClient/cache/` 后自动切换播放页播放。
 
 ### Ubuntu 服务端
@@ -56,7 +58,7 @@ AVProject 是一个面向音视频学习与工程整合的 C++ 客户端/服务�
 - 上传文件先写入 `temp/*.part`，任务元数据原子写入 `temp/tasks/*.task`，完成校验后移动到 `media/`。
 - 服务端启动时恢复未完成上传任务，并按 `.part` 实际大小返回安全恢复偏移。
 - 上传任务默认保留 72 小时，每 5 分钟低频清理一次过期且未绑定连接的任务。
-- 下载时按 offset 从 `media/` 读取指定分片。
+- 下载保持服务端无状态：校验文件大小与修改时间后，按 offset 从 `media/` 读取指定分片。
 - 媒体扩展名白名单、文件名检查和路径穿越防护。
 - 上传同名文件自动增加 `_1`、`_2` 后缀。
 - 连接断开时只解除上传任务的当前会话绑定，保留可恢复任务和 `.part` 文件。
@@ -92,7 +94,7 @@ AVClient (Windows / Qt)
 ├── RemoteMediaPage
 │   ├── 媒体列表
 │   ├── 分片上传与任务恢复
-│   └── 分片下载与 cache
+│   └── 可恢复分片下载、任务状态与 cache
 ├── SettingsPage
 └── AVNetworkClient -> TcpClient / Winsock
                          │
@@ -121,7 +123,8 @@ AVServer (Ubuntu)
 | 阶段 5 | 64 KB 分片下载与下载后播放 | 完成 |
 | 阶段 6 | 工程文档、架构说明与面试复盘 | 完成 |
 | 阶段 7 | epoll LT 单线程 Reactor 与多客户端并发 | 完成 |
-| 阶段 8 | 上传断点续传与客户端/服务端任务恢复 | 当前阶段 |
+| 阶段 8 | 上传断点续传与客户端/服务端任务恢复 | 完成 |
+| 阶段 9 | 下载断点续传与客户端任务恢复 | 当前阶段 |
 
 各阶段记录位于 [docs/stage_logs](docs/stage_logs/)。
 
@@ -138,7 +141,7 @@ AVProject/
 │   ├── deploy/                # DLL 部署脚本
 │   ├── bin/                   # 运行目录，不提交
 │   ├── cache/                 # 下载缓存，不提交
-│   └── transfer_state/        # 客户端未完成上传状态，不提交
+│   └── transfer_state/        # 客户端未完成上传/下载状态，不提交
 ├── AVServer/                  # 当前 Ubuntu 媒体服务器
 │   ├── include/               # Reactor、连接上下文、协议与业务管理器
 │   ├── src/                   # epoll 网络层和协议业务实现
@@ -179,7 +182,7 @@ D:\Software\Qt\Tools\mingw730_32\bin\mingw32-make.exe -j4
 - 通用业务线程池和异步磁盘 I/O。
 - 用户注册、登录鉴权、权限和配额。
 - MySQL 媒体索引。
-- 下载断点续传和通用传输取消。
+- 通用传输暂停、取消和自动重试。
 - 多文件并行上传或下载。
 - 服务端 MD5/SHA-256 强内容完整性校验。
 - 删除、重命名和搜索。
@@ -189,7 +192,7 @@ D:\Software\Qt\Tools\mingw730_32\bin\mingw32-make.exe -j4
 ## 后续优化方向
 
 1. 在保持 epoll 线程只管理连接状态的前提下，引入有界工作线程池处理磁盘 I/O 和耗时业务。
-2. 在已有上传恢复基础上增加下载断点续传、通用取消和 SHA-256 校验。
+2. 在已有上传和下载恢复基础上增加通用取消和 SHA-256 校验。
 3. 加入用户认证、权限控制和可选数据库索引。
 4. 增加远程删除、重命名、搜索和分页。
 5. 统一第三方依赖目录与可配置构建路径。
@@ -205,3 +208,4 @@ D:\Software\Qt\Tools\mingw730_32\bin\mingw32-make.exe -j4
 - [面试问答复盘](docs/INTERVIEW_QA.md)
 - [阶段 7：epoll 多客户端改造](docs/stage_logs/STAGE7_EPOLL_MULTI_CLIENT.md)
 - [阶段 8：上传断点续传与任务恢复](docs/stage_logs/STAGE8_RESUMABLE_UPLOAD.md)
+- [阶段 9：下载断点续传与客户端任务恢复](docs/stage_logs/STAGE9_RESUMABLE_DOWNLOAD.md)

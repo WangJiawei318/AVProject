@@ -52,7 +52,7 @@ SettingsPage::SettingsPage(AVNetworkClient *networkClient, QWidget *parent)
     m_logEdit->setReadOnly(true);
     m_logEdit->setMinimumHeight(260);
 
-    auto *hint = new QLabel("This connection is shared by remote media listing, resumable upload, download and Ping/Pong.", this);
+    auto *hint = new QLabel("This connection is shared by remote media listing, resumable upload and download, and Ping/Pong.", this);
     hint->setWordWrap(true);
 
     root->addLayout(form);

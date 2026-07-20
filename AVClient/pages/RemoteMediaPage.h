@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <QWidget>
 
+#include "DownloadTaskStore.h"
 #include "UploadTaskStore.h"
 
 class AVNetworkClient;
@@ -54,6 +55,8 @@ private slots:
     void slotDownloadInitResponse(bool success,
                                   const QString &fileName,
                                   qint64 fileSize,
+                                  qint64 modifiedTime,
+                                  qint64 acceptedOffset,
                                   const QString &message);
     void slotDownloadBlockResponse(bool success,
                                    const QString &fileName,
@@ -66,6 +69,9 @@ private slots:
     void slotUploadTaskSelectionChanged();
     void slotResumeUploadClicked();
     void slotAbandonUploadClicked();
+    void slotDownloadTaskSelectionChanged();
+    void slotResumeDownloadClicked();
+    void slotAbandonDownloadClicked();
 
 private:
     void appendLog(const QString &message);
@@ -80,8 +86,17 @@ private:
     QString localTaskStatus(const UploadTaskState &task) const;
     bool isSupportedMediaFile(const QString &filePath) const;
     void startDownload(bool playAfterDownload);
+    void continueDownloadAfterInitialization();
     void requestNextDownloadBlock();
-    void finishDownloadState(bool success, const QString &message);
+    void finishDownloadState(bool success,
+                             const QString &message,
+                             const QString &failureStatus = "waiting");
+    bool saveCurrentDownloadTask(const QString &status);
+    void refreshDownloadTaskTable();
+    bool selectedDownloadTask(DownloadTaskState *task) const;
+    QString localDownloadTaskStatus(const DownloadTaskState &task) const;
+    bool prepareSafeDownloadOffset(DownloadTaskState *task, QString *error);
+    bool hasConflictingDownloadTask(const QString &fileName) const;
     QString selectedMediaFile() const;
     bool isSafeCacheFileName(const QString &fileName) const;
     void updateActionStates();
@@ -114,14 +129,22 @@ private:
     QLabel *m_selectedFileLabel;
     QLabel *m_downloadStatusLabel;
     QProgressBar *m_downloadProgress;
+    QTableWidget *m_downloadTaskTable;
+    QPushButton *m_resumeDownloadButton;
+    QPushButton *m_abandonDownloadButton;
     QFile *m_downloadFile;
     QString m_downloadFileName;
     QString m_downloadPartPath;
     QString m_downloadFinalPath;
     qint64 m_downloadFileSize;
+    qint64 m_downloadModifiedTime;
     qint64 m_downloadOffset;
     bool m_downloading;
+    bool m_resumingDownload;
+    bool m_hasCurrentDownloadTask;
     bool m_playAfterDownload;
+    DownloadTaskState m_currentDownloadTask;
+    DownloadTaskStore m_downloadTaskStore;
 };
 
 #endif // REMOTEMEDIAPAGE_H
