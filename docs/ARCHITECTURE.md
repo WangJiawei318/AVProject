@@ -210,7 +210,7 @@ Winsock TCP
 [int32_t packLen][packLen 字节业务包体]
 ```
 
-客户端 `recvAll()` 和服务端 `readExact()` 循环读取，解决 TCP 半包。下一条消息的长度头又提供了消息边界，解决粘包。
+客户端 `recvAll()` 循环读取长度头和包体；服务端把 non-blocking `recv()` 得到的字节追加到每连接 `receiveBuffer` 并增量解析。两种实现都依靠长度头恢复消息边界，从而处理半包和粘包。
 
 ## 8. 远程媒体库模块
 
@@ -340,32 +340,59 @@ PlayerPage
 ```text
 main()
   -> AVServer::start(8000)
-      -> socket / bind / listen
-      -> accept 一个客户端
-      -> handleClient()
-          -> readExact(length)
-          -> readExact(body)
-          -> handlePacket()
-      -> 客户端断开后继续 accept
+      -> EpollServer::start(8000)
+          -> 创建 non-blocking listen socket
+          -> bind / listen / epoll_create1
+          -> epoll_wait LT 事件循环
+              -> accept 新连接到 EAGAIN
+              -> 为每个 fd 创建 ConnectionContext
+              -> EPOLLIN: recv 到 EAGAIN，增量解析长度帧
+              -> ProtocolDispatcher 生成响应包体
+              -> 加入该连接 sendQueue
+              -> EPOLLOUT: 从 sendOffset 继续发送
+              -> 错误或断开: 只清理当前 fd
 ```
 
-`handlePacket()` 根据 `PackType` 使用 switch 分发到 Ping、列表、上传和下载处理函数。
+`AVServer` 现在是很薄的启动外观，网络事件由 `EpollServer` 负责，完整协议包由 `ProtocolDispatcher` 按 `PackType` 分发到 Ping、列表、上传和下载处理函数。业务层只返回响应包体，不直接调用 `send()`。
 
 ### 14.2 当前并发能力
 
-当前服务器在 `accept()` 后同步执行 `handleClient()`。一个客户端未断开时，主循环不会 accept 第二个客户端。因此它适合阶段验证和单客户端演示，不适合直接描述为高并发服务器。
+当前服务器采用单线程 Reactor：一个 epoll 实例同时关注 listen fd 和所有 client fd。每个连接都有独立 `ConnectionContext`，因此某个连接等待网络数据、发生半包或发送暂时不可写时，不会阻止服务器处理其他已就绪连接。
 
-### 14.3 与 NetDisk-Server 的关系
+这里的“并发”指多个连接的 I/O 状态被事件循环交替推进，不代表多核并行执行。媒体目录扫描、上传写盘和下载读盘当前仍在 Reactor 线程同步完成；慢磁盘或耗时文件操作仍可能短暂拖延其他连接，后续应在不改变协议的前提下接入有界工作线程池。
 
-原始 `NetDisk-Server` 包含 epoll、线程池、协议分发和 MySQL 示例。当前 `AVServer` 借鉴了长度帧和协议分发思想，但为了降低依赖与整合风险，先实现了独立的最小服务器。
+### 14.3 ConnectionContext
 
-未来可把当前 `MediaManager`、`UploadManager` 和 `DownloadManager` 作为业务层，接入 epoll 网络层与线程池。
+每个 client fd 对应一个 `ConnectionContext`，保存：
+
+- 对端 IP 和端口；
+- 独立 `receiveBuffer`；
+- 独立 `sendQueue`、当前发送项及 offset；
+- 已排队但尚未发送的字节数；
+- 最后活动时间与连接状态。
+
+接收时先把任意数量的字节追加到 `receiveBuffer`。缓冲区不足 4 字节时继续等待；读到包长后先校验范围，数据不足一个完整包时仍继续等待。取出完整包后立即继续解析缓冲区，因此同一轮既能处理半包，也能处理粘在一起的多个包。当前长度头沿用阶段 1 至 5 的主机字节序，最大包体限制为 256 KB。
+
+响应先被封装成“4 字节长度 + 包体”并进入该连接的发送队列。服务器立即尝试 `send()`；如果只写出一部分，就保存 offset 并注册 `EPOLLOUT`。队列清空后取消 `EPOLLOUT`，避免 socket 长期可写导致事件循环空转。单连接队列上限为 4 MB，慢客户端持续不读时会被关闭，防止无限占用内存。
+
+### 14.4 协议与业务层
+
+`ProtocolDispatcher` 持有 `MediaManager`、`UploadManager` 和 `DownloadManager`。它接收已经去掉长度头的完整包体，校验具体结构大小，调用业务管理器，再把一个或多个响应包体交还给网络层。这样 `EpollServer` 不理解媒体业务，业务管理器也不依赖 epoll。
+
+上传任务额外记录 `owner_fd`。BLOCK、FINISH 必须来自创建任务的连接；连接断开时只删除该 fd 的未完成任务和 `.part` 文件。下载继续使用 `filename + offset + request_size` 独立读取，没有跨客户端共享文件游标，多个客户端请求同一文件不会互相改变读取位置。
+
+### 14.5 与 NetDisk-Server 的关系
+
+原始 `NetDisk-Server` 包含 epoll、线程池、协议分发和 MySQL 示例。主线 `AVServer` 现在吸收了 epoll Reactor 和协议分层思想，但没有照搬网盘业务、MySQL 或线程池。
+
+本阶段先把连接生命周期、增量收包和非阻塞发送做稳定。后续线程池应作为独立阶段加入，并为 ConnectionContext 生命周期、响应回投和同一上传任务的顺序提供明确约束。
 
 ## 15. 关键设计取舍
 
 | 取舍 | 当前选择 | 原因 |
 | --- | --- | --- |
-| 服务端并发 | 阻塞式单连接 | 先验证协议和文件闭环 |
+| 服务端并发 | epoll LT 单线程 Reactor | 支持多连接，同时控制第一版复杂度 |
+| 文件 I/O | Reactor 内同步 64 KB 读写 | 暂不引入线程池和跨线程生命周期问题 |
 | 媒体索引 | 扫描目录 | 不依赖 MySQL |
 | 传输方式 | 64 KB 串行 ACK | 状态简单、内存固定 |
 | 上传落盘 | temp 后提交 | 不暴露半成品 |
@@ -377,7 +404,8 @@ main()
 
 当前限制：
 
-- 单连接阻塞服务器；
+- Reactor 中仍有同步目录扫描和文件 I/O；
+- 暂无工作线程池，不能利用多核并行业务处理；
 - 协议使用主机字节序和 packed struct，跨架构能力有限；
 - 没有认证、权限、配额和 TLS；
 - 没有任务持久化、断点和哈希；
@@ -388,7 +416,6 @@ main()
 
 1. 为协议增加版本、网络字节序和明确整数编码。
 2. 为上传下载增加 task id、取消、超时和哈希。
-3. 将服务端替换为 epoll + 工作线程模型。
+3. 接入有界工作线程池，将磁盘 I/O 与耗时业务结果安全回投 epoll 线程。
 4. 增加用户认证和可选数据库索引。
 5. 最后评估自定义 AVIO、HTTP/HLS 或对象存储。
-

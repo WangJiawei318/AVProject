@@ -25,6 +25,8 @@ upload temp directory: temp
 listening on port 8000
 ```
 
+阶段 7 还应看到 `epoll initialized`。后续连接和协议日志应带有 `fd=...`。
+
 ## 3. 启动并连接客户端
 
 1. 启动 `AVClient/bin/AVClient.exe`。
@@ -81,7 +83,18 @@ Remote Media 页点击 Refresh media list，确认列表与 `AVServer/media/` �
 
 该流程全部通过即可完成当前版本核心演示。
 
-## 6. 常见异常测试
+## 6. 多客户端并发测试
+
+先运行自动化 Ping 和列表测试：
+
+```bash
+cd ~/AVProject
+python3 tools/concurrent_client_test.py 192.168.44.130 8000 5 --pings 10 --media-list
+```
+
+确认 5 个连接均成功且 `failed=0`。再启动至少 3 个 AVClient：A 上传文件，B 持续 Ping，C 刷新列表或下载；中途关闭 A，确认 B、C 仍可使用，并检查 A 的未完成 `temp/*.part` 已清理。
+
+## 7. 常见异常测试
 
 | 场景 | 预期结果 |
 | --- | --- |
@@ -95,8 +108,10 @@ Remote Media 页点击 Refresh media list，确认列表与 `AVServer/media/` �
 | 下载中断开连接 | 客户端删除 `.part` 并恢复按钮 |
 | 上传同名文件 | 服务端自动生成 `_1`、`_2` 名称 |
 | cache 已有同名文件 | 完整下载后用新文件替换 |
+| 一个客户端发送非法包长 | 只关闭该连接，其他客户端继续工作 |
+| 一个客户端长期不读取响应 | 该连接发送队列达到上限后被关闭 |
 
-## 7. 测试记录建议
+## 8. 测试记录建议
 
 演示或提交前记录：
 
@@ -104,6 +119,6 @@ Remote Media 页点击 Refresh media list，确认列表与 `AVServer/media/` �
 - Qt/MinGW 与 Ubuntu/g++ 版本；
 - 测试文件名和大小；
 - Ping、列表、上传、下载结果；
+- 并发工具成功数、失败数和耗时；
 - 是否完成下载后自动播放；
 - 已知问题。
-

@@ -66,10 +66,10 @@ DOWNLOAD_INIT_RQ
 项目当前限制：
 
 ```text
-0 < packLen <= 1 MB
+sizeof(PackType) <= packLen <= 256 KB（阶段 7 服务端）
 ```
 
-客户端由 `TcpClient::sendPacket()` 添加长度头，服务端由 `AVServer::sendPacket()` 添加长度头。
+客户端由 `TcpClient::sendPacket()` 添加长度头；服务端由 `EpollServer::queueResponse()` 添加长度头并进入每连接发送队列。客户端接收侧仍使用原有上限，服务端阶段 7 使用更严格的 256 KB 上限，当前 64 KB 分片协议完全处于该范围内。
 
 ## 5. TCP 粘包与半包
 
@@ -77,12 +77,12 @@ DOWNLOAD_INIT_RQ
 
 发送端发出 1000 字节，接收端第一次 `recv()` 可能只得到 300 字节，剩余 700 字节以后到达。这不是 TCP 出错，而是字节流的正常行为。
 
-项目使用：
+项目使用两种等价的组帧方式：
 
 - 客户端 `TcpClient::recvAll()`；
-- 服务端 `AVServer::readExact()`。
+- 服务端 `ConnectionContext::receiveBuffer` + `EpollServer::parseFrames()`。
 
-它们循环调用 `recv()`，直到读满目标长度或连接断开。
+客户端循环读取指定长度；服务端 non-blocking recv 到 `EAGAIN`，把字节追加到独立缓冲，不足一帧时保留到下一次 EPOLLIN。
 
 ### 5.2 粘包
 
@@ -457,7 +457,7 @@ message: char[128]
 
 64 KB 的考虑：
 
-- 远小于 1 MB 单包上限；
+- 远小于阶段 7 服务端 256 KB 单包上限；
 - 单次内存固定；
 - 比几 KB 小块减少往返次数；
 - 进度反馈足够细；
@@ -482,7 +482,7 @@ message: char[128]
 
 当前已有：
 
-- 1 MB 帧长度上限；
+- 服务端 256 KB 帧长度上限；
 - 64 KB 文件块上限；
 - 固定结构大小检查；
 - 动态头声明长度与实际包长一致性检查；
@@ -580,4 +580,3 @@ block_index 或 offset
 - 超时和取消；
 - 任务优先级；
 - 失败重试策略。
-

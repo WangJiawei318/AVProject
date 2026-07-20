@@ -2,6 +2,7 @@
 #define UPLOADMANAGER_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <map>
 #include <string>
 
@@ -13,22 +14,26 @@ public:
     ~UploadManager();
 
     bool ensureDirectories();
-    bool createUpload(const std::string &fileName,
+    bool createUpload(int ownerFd,
+                      const std::string &fileName,
                       const std::string &extension,
                       int64_t fileSize,
                       std::string *uploadId,
                       std::string *message);
-    bool writeBlock(const std::string &uploadId,
+    bool writeBlock(int ownerFd,
+                    const std::string &uploadId,
                     int64_t offset,
                     const char *data,
                     int32_t dataSize,
                     int64_t *receivedOffset,
                     std::string *message);
-    bool finishUpload(const std::string &uploadId,
+    bool finishUpload(int ownerFd,
+                      const std::string &uploadId,
                       const std::string &fileName,
                       int64_t fileSize,
                       std::string *savedFileName,
                       std::string *message);
+    size_t abortByOwner(int ownerFd);
     void abortAll();
 
     const std::string &tempDir() const;
@@ -36,6 +41,7 @@ public:
 private:
     struct UploadTask
     {
+        int ownerFd;
         std::string fileName;
         std::string extension;
         std::string tempPath;

@@ -210,13 +210,23 @@ make --version
 
 ## 8. Ubuntu 服务端构建
 
-确保 Windows 项目中的以下阶段 5 文件已经同步到 Ubuntu：
+确保阶段 7 的完整 `AVServer/` 已同步到 Ubuntu，尤其包括：
 
 ```text
 AVServer/include/av_protocol.h
 AVServer/include/AVServer.h
+AVServer/include/ConnectionContext.h
+AVServer/include/EpollServer.h
+AVServer/include/ProtocolDispatcher.h
+AVServer/include/MediaManager.h
+AVServer/include/UploadManager.h
 AVServer/include/DownloadManager.h
 AVServer/src/AVServer.cpp
+AVServer/src/ConnectionContext.cpp
+AVServer/src/EpollServer.cpp
+AVServer/src/ProtocolDispatcher.cpp
+AVServer/src/MediaManager.cpp
+AVServer/src/UploadManager.cpp
 AVServer/src/DownloadManager.cpp
 AVServer/Makefile
 ```
@@ -246,6 +256,18 @@ AVServer/AVServer
 ```bash
 ./AVServer
 ```
+
+阶段 7 启动后应看到类似日志：
+
+```text
+media directory: media
+upload temp directory: temp
+server started
+epoll initialized
+listening on port 8000
+```
+
+客户端连接和协议日志会包含 `fd=...`，用于区分多个并发连接。
 
 ## 9. 服务端运行目录
 
@@ -320,7 +342,19 @@ Windows 测试 TCP：
 Test-NetConnection 192.168.44.130 -Port 8000
 ```
 
-## 12. 推荐启动顺序
+## 12. 并发测试工具
+
+`tools/concurrent_client_test.py` 只使用 Python 标准库。它会建立多个同步起跑的连接，每个连接重复发送 Ping，也可额外校验媒体列表：
+
+```bash
+cd ~/AVProject
+python3 tools/concurrent_client_test.py 192.168.44.130 8000 5
+python3 tools/concurrent_client_test.py 192.168.44.130 8000 5 --pings 10 --media-list
+```
+
+输出应显示每个 client 成功以及汇总中的 `failed=0`。当前长度头和结构体整数沿用主机小端格式，因此测试机与服务端应保持当前 x86/x86-64 小端环境。
+
+## 13. 推荐启动顺序
 
 1. Ubuntu 进入 `AVServer/`。
 2. `make clean && make`。
@@ -331,9 +365,9 @@ Test-NetConnection 192.168.44.130 -Port 8000
 7. Send Ping。
 8. Remote Media 页刷新列表。
 
-## 13. 常见构建问题
+## 14. 常见构建问题
 
-### 13.1 客户端链接库位数不匹配
+### 14.1 客户端链接库位数不匹配
 
 表现：
 
@@ -345,7 +379,7 @@ undefined reference
 
 检查 Qt、MinGW、FFmpeg、SDL、OpenCV 是否全部为 32-bit MinGW 兼容版本。
 
-### 13.2 缺少 qwindows 插件
+### 14.2 缺少 qwindows 插件
 
 表现：
 
@@ -359,7 +393,7 @@ could not find or load the Qt platform plugin "windows"
 AVClient/bin/platforms/qwindowsd.dll
 ```
 
-### 13.3 服务端提示 address already in use
+### 14.3 服务端提示 address already in use
 
 检查已有进程：
 
@@ -369,7 +403,7 @@ ss -lntp | grep 8000
 
 停止旧服务端，或临时换端口并在客户端同步修改。
 
-### 13.4 服务端提示 unknown packet type: 20013
+### 14.4 服务端提示 unknown packet type: 20013
 
 `20013` 是 `DOWNLOAD_INIT_RQ`。这说明客户端已经发出阶段 5 下载请求，但当前运行的服务端二进制没有阶段 5 分发逻辑。
 
@@ -377,16 +411,16 @@ ss -lntp | grep 8000
 
 ```bash
 cd ~/AVProject/AVServer
-grep -n "DEF_PACK_DOWNLOAD_INIT_RQ" include/av_protocol.h src/AVServer.cpp
+grep -n "DEF_PACK_DOWNLOAD_INIT_RQ" include/av_protocol.h src/ProtocolDispatcher.cpp
 grep -n "DownloadManager" Makefile
 make clean
 make
 ./AVServer 8000
 ```
 
-如果 grep 没有结果，先把阶段 5 源码完整同步到 Ubuntu。
+如果 grep 没有结果，先把当前 `AVServer/` 源码完整同步到 Ubuntu 并重新构建，避免仍在运行阶段 5 的旧二进制。
 
-### 13.5 服务端列表为空
+### 14.5 服务端列表为空
 
 确认从正确工作目录启动，并检查：
 
@@ -397,11 +431,10 @@ ls -lah media
 
 文件后缀应处于支持白名单。
 
-### 13.6 服务端目录无权限
+### 14.6 服务端目录无权限
 
 ```bash
 ls -ld . media temp
 ```
 
 运行用户需要对项目运行目录具有读写和重命名权限。
-

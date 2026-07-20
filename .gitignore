@@ -31,6 +31,8 @@ qrc_*
 cache/
 temp/
 tmp/
+__pycache__/
+*.pyc
 *.log
 *.part
 

@@ -28,7 +28,8 @@ bool UploadManager::ensureDirectories()
     return ensureDirectory(m_tempDir) && ensureDirectory(m_mediaDir);
 }
 
-bool UploadManager::createUpload(const std::string &fileName,
+bool UploadManager::createUpload(int ownerFd,
+                                 const std::string &fileName,
                                  const std::string &extension,
                                  int64_t fileSize,
                                  std::string *uploadId,
@@ -54,6 +55,7 @@ bool UploadManager::createUpload(const std::string &fileName,
     }
 
     UploadTask task;
+    task.ownerFd = ownerFd;
     task.fileName = fileName;
     task.extension = ext;
     task.expectedSize = fileSize;
@@ -75,7 +77,8 @@ bool UploadManager::createUpload(const std::string &fileName,
     return true;
 }
 
-bool UploadManager::writeBlock(const std::string &uploadId,
+bool UploadManager::writeBlock(int ownerFd,
+                               const std::string &uploadId,
                                int64_t offset,
                                const char *data,
                                int32_t dataSize,
@@ -90,6 +93,10 @@ bool UploadManager::writeBlock(const std::string &uploadId,
 
     UploadTask &task = it->second;
     *receivedOffset = task.receivedSize;
+    if (task.ownerFd != ownerFd) {
+        *message = "upload task belongs to another connection";
+        return false;
+    }
     if (!data || dataSize <= 0 || dataSize > 64 * 1024) {
         *message = "invalid block size";
         return false;
@@ -123,7 +130,8 @@ bool UploadManager::writeBlock(const std::string &uploadId,
     return true;
 }
 
-bool UploadManager::finishUpload(const std::string &uploadId,
+bool UploadManager::finishUpload(int ownerFd,
+                                 const std::string &uploadId,
                                  const std::string &fileName,
                                  int64_t fileSize,
                                  std::string *savedFileName,
@@ -136,6 +144,10 @@ bool UploadManager::finishUpload(const std::string &uploadId,
     }
 
     UploadTask task = it->second;
+    if (task.ownerFd != ownerFd) {
+        *message = "upload task belongs to another connection";
+        return false;
+    }
     if (fileName != task.fileName || fileSize != task.expectedSize) {
         *message = "upload metadata does not match";
         return false;
@@ -160,6 +172,22 @@ bool UploadManager::finishUpload(const std::string &uploadId,
     *savedFileName = finalName;
     *message = "upload completed";
     return true;
+}
+
+size_t UploadManager::abortByOwner(int ownerFd)
+{
+    size_t removed = 0;
+    std::map<std::string, UploadTask>::iterator it = m_tasks.begin();
+    while (it != m_tasks.end()) {
+        if (it->second.ownerFd == ownerFd) {
+            removeTaskFile(it->second);
+            it = m_tasks.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
 }
 
 void UploadManager::abortAll()
