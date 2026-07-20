@@ -1,0 +1,109 @@
+# AVProject 完整测试流程
+
+## 1. 测试前准备
+
+- Ubuntu IP：`192.168.44.130`
+- 服务端端口：`8000`
+- `AVServer/media/` 至少准备一个受支持媒体
+- Windows 摄像头、麦克风按录制需要授权
+
+## 2. 启动服务端
+
+```bash
+cd ~/AVProject/AVServer
+make clean
+make
+./AVServer 8000
+```
+
+确认打印：
+
+```text
+server started
+media directory: media
+upload temp directory: temp
+listening on port 8000
+```
+
+## 3. 启动并连接客户端
+
+1. 启动 `AVClient/bin/AVClient.exe`。
+2. 打开 Settings。
+3. 输入 `192.168.44.130` 和 `8000`。
+4. 点击 Connect。
+5. 确认状态为 Connected。
+
+## 4. 功能测试
+
+### 4.1 Ping
+
+点击 Send Ping，确认客户端收到 Pong，服务端打印 `PING_RQ/PING_RS`。
+
+### 4.2 本地播放
+
+Player 页打开本地媒体，验证播放、暂停、恢复、停止和 seek。
+
+### 4.3 本地录制
+
+Recorder 页开始录制数秒后停止，确认 `AVClient/bin/recordings/` 生成 FLV，并能在 Player 页播放。
+
+### 4.4 远程列表
+
+Remote Media 页点击 Refresh media list，确认列表与 `AVServer/media/` 一致。
+
+### 4.5 上传
+
+点击 Select and upload file，选择支持格式，确认进度到 100%、服务端 `media/` 出现文件、列表自动刷新。
+
+### 4.6 下载
+
+选择远程文件，点击 Download file，确认：
+
+- 进度到 100%；
+- `AVClient/cache/` 出现正式文件；
+- 文件大小与服务端一致；
+- Player 页可手动打开。
+
+### 4.7 下载并播放
+
+选择远程文件，点击 Download and play，确认下载完成后自动切换 Player 页并开始播放。
+
+## 5. 完整闭环
+
+```text
+本地录制或准备媒体
+  -> 上传到 AVServer/media/
+  -> 刷新远程列表
+  -> 选择刚上传的文件
+  -> 下载到 AVClient/cache/
+  -> 自动切换并播放
+```
+
+该流程全部通过即可完成当前版本核心演示。
+
+## 6. 常见异常测试
+
+| 场景 | 预期结果 |
+| --- | --- |
+| 服务端未启动 | Connect 失败，客户端不崩溃 |
+| 未连接时刷新 | 提示先连接，不能发送列表请求 |
+| 未连接时上传/下载 | 弹出连接提示 |
+| 上传不支持格式 | 客户端拒绝，服务端也有白名单 |
+| 下载未选择文件 | 提示先选择远程媒体 |
+| `media/` 为空 | 列表为空并记录日志 |
+| 上传中断开连接 | 客户端恢复按钮，服务端清理临时任务 |
+| 下载中断开连接 | 客户端删除 `.part` 并恢复按钮 |
+| 上传同名文件 | 服务端自动生成 `_1`、`_2` 名称 |
+| cache 已有同名文件 | 完整下载后用新文件替换 |
+
+## 7. 测试记录建议
+
+演示或提交前记录：
+
+- 客户端和服务端 commit；
+- Qt/MinGW 与 Ubuntu/g++ 版本；
+- 测试文件名和大小；
+- Ping、列表、上传、下载结果；
+- 是否完成下载后自动播放；
+- 已知问题。
+

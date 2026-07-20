@@ -32,6 +32,7 @@ cache/
 temp/
 tmp/
 *.log
+*.part
 
 # Media output files
 *.mp4
@@ -39,6 +40,8 @@ tmp/
 *.avi
 *.mkv
 *.mov
+*.wmv
+*.mp3
 *.wav
 *.aac
 *.pcm
@@ -60,6 +63,7 @@ AVServer/media/
 AVServer/build/
 AVServer/log/
 AVServer/temp/
+/AVServer/AVServer
 
 # AVClient runtime cache
 AVClient/cache/
