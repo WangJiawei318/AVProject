@@ -1,12 +1,14 @@
 #include "RemoteMediaPage.h"
 
 #include "AVNetworkClient.h"
+#include "av_protocol.h"
 
 #include <QAbstractItemView>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QCoreApplication>
+#include <QComboBox>
 #include <QDateTime>
 #include <QDir>
 #include <QHeaderView>
@@ -35,6 +37,7 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
       m_resumingUpload(false),
       m_hasCurrentUploadTask(false),
       m_downloadFile(new QFile(this)),
+      m_downloadMediaId(0),
       m_downloadFileSize(0),
       m_downloadModifiedTime(0),
       m_downloadOffset(0),
@@ -49,10 +52,15 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
 
     auto *top = new QHBoxLayout;
     m_statusLabel = new QLabel(this);
+    m_scopeCombo = new QComboBox(this);
+    m_scopeCombo->addItem("Public media", AV_MEDIA_SCOPE_PUBLIC);
+    m_scopeCombo->addItem("My media", AV_MEDIA_SCOPE_MINE);
     m_refreshButton = new QPushButton("Refresh media list", this);
     m_uploadButton = new QPushButton("Select and upload file", this);
     top->addWidget(new QLabel("Server:", this));
     top->addWidget(m_statusLabel);
+    top->addWidget(new QLabel("View:", this));
+    top->addWidget(m_scopeCombo);
     top->addStretch();
     top->addWidget(m_uploadButton);
     top->addWidget(m_refreshButton);
@@ -121,10 +129,12 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
     downloadTaskActions->addWidget(m_abandonDownloadButton);
 
     m_table = new QTableWidget(this);
-    m_table->setColumnCount(4);
-    m_table->setHorizontalHeaderLabels(QStringList() << "File name" << "Size" << "Modified time" << "Type");
+    m_table->setColumnCount(6);
+    m_table->setHorizontalHeaderLabels(
+                QStringList() << "ID" << "File name" << "Uploader"
+                              << "Size" << "Type" << "Uploaded at");
     m_table->horizontalHeader()->setStretchLastSection(true);
-    m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_table->setSelectionMode(QAbstractItemView::SingleSelection);
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -183,7 +193,14 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
             this,
             SLOT(slotSelectionChanged()));
     connect(m_networkClient, SIGNAL(connectedChanged(bool)), this, SLOT(slotConnectedChanged(bool)));
-    connect(m_networkClient, SIGNAL(mediaListReceived(QString)), this, SLOT(slotMediaListReceived(QString)));
+    connect(m_networkClient,
+            SIGNAL(authenticationChanged(bool,quint64,QString)),
+            this,
+            SLOT(slotAuthenticationChanged(bool,quint64,QString)));
+    connect(m_networkClient,
+            SIGNAL(mediaListResponse(bool,QString,QString)),
+            this,
+            SLOT(slotMediaListResponse(bool,QString,QString)));
     connect(m_networkClient, SIGNAL(logMessage(QString)), this, SLOT(slotLogMessage(QString)));
     connect(m_networkClient,
             SIGNAL(uploadInitResponse(bool,QString,QString,qint64,QString,QString)),
@@ -198,21 +215,21 @@ RemoteMediaPage::RemoteMediaPage(AVNetworkClient *networkClient, QWidget *parent
             this,
             SLOT(slotUploadBlockResponse(bool,QString,qint64,QString)));
     connect(m_networkClient,
-            SIGNAL(uploadFinishResponse(bool,QString,QString)),
+            SIGNAL(uploadFinishResponse(bool,quint64,QString,QString)),
             this,
-            SLOT(slotUploadFinishResponse(bool,QString,QString)));
+            SLOT(slotUploadFinishResponse(bool,quint64,QString,QString)));
     connect(m_networkClient,
-            SIGNAL(downloadInitResponse(bool,QString,qint64,qint64,qint64,QString)),
+            SIGNAL(downloadInitResponse(bool,quint64,QString,qint64,qint64,qint64,QString)),
             this,
-            SLOT(slotDownloadInitResponse(bool,QString,qint64,qint64,qint64,QString)));
+            SLOT(slotDownloadInitResponse(bool,quint64,QString,qint64,qint64,qint64,QString)));
     connect(m_networkClient,
-            SIGNAL(downloadBlockResponse(bool,QString,qint64,QByteArray,QString)),
+            SIGNAL(downloadBlockResponse(bool,quint64,QString,qint64,QByteArray,QString)),
             this,
-            SLOT(slotDownloadBlockResponse(bool,QString,qint64,QByteArray,QString)));
+            SLOT(slotDownloadBlockResponse(bool,quint64,QString,qint64,QByteArray,QString)));
     connect(m_networkClient,
-            SIGNAL(downloadFinishResponse(bool,QString,QString)),
+            SIGNAL(downloadFinishResponse(bool,quint64,QString,QString)),
             this,
-            SLOT(slotDownloadFinishResponse(bool,QString,QString)));
+            SLOT(slotDownloadFinishResponse(bool,quint64,QString,QString)));
 
     slotConnectedChanged(m_networkClient->isConnected());
     refreshUploadTaskTable();
@@ -226,14 +243,23 @@ void RemoteMediaPage::slotRefreshClicked()
         appendLog("please connect to server first");
         return;
     }
+    if (!m_networkClient->isAuthenticated()) {
+        appendLog("please log in before requesting media");
+        return;
+    }
 
     appendLog("requesting remote media list");
-    m_networkClient->sendMediaListRequest();
+    m_networkClient->sendMediaListRequest(m_scopeCombo->currentData().toInt());
 }
 
 void RemoteMediaPage::slotConnectedChanged(bool connected)
 {
-    m_statusLabel->setText(connected ? "Connected" : "Disconnected");
+    m_statusLabel->setText(!connected
+                           ? "Disconnected"
+                           : (m_networkClient->isAuthenticated()
+                              ? QString("Authenticated as %1")
+                                .arg(m_networkClient->currentUsername())
+                              : "Connected, login required"));
     if (!connected && m_uploading)
         finishUploadState(false, "upload stopped: server disconnected");
     if (!connected && m_downloading)
@@ -241,8 +267,29 @@ void RemoteMediaPage::slotConnectedChanged(bool connected)
     updateActionStates();
 }
 
-void RemoteMediaPage::slotMediaListReceived(const QString &payload)
+void RemoteMediaPage::slotAuthenticationChanged(bool authenticated,
+                                                quint64 userId,
+                                                const QString &username)
 {
+    Q_UNUSED(userId);
+    m_statusLabel->setText(authenticated
+                           ? QString("Authenticated as %1").arg(username)
+                           : (m_networkClient->isConnected()
+                              ? "Connected, login required" : "Disconnected"));
+    if (!authenticated)
+        clearTable();
+    updateActionStates();
+}
+
+void RemoteMediaPage::slotMediaListResponse(bool success,
+                                            const QString &payload,
+                                            const QString &message)
+{
+    if (!success) {
+        clearTable();
+        appendLog(QString("media list failed: %1").arg(message));
+        return;
+    }
     fillTable(payload);
 }
 
@@ -259,6 +306,11 @@ void RemoteMediaPage::slotUploadClicked()
     if (!m_networkClient->isConnected()) {
         appendLog("please connect to server first");
         QMessageBox::information(this, "Upload media", "Please connect to server first.");
+        return;
+    }
+    if (!m_networkClient->isAuthenticated()) {
+        appendLog("please log in before uploading media");
+        QMessageBox::information(this, "Upload media", "Please log in first.");
         return;
     }
     if (m_uploading)
@@ -423,19 +475,22 @@ void RemoteMediaPage::slotUploadBlockResponse(bool success,
 }
 
 void RemoteMediaPage::slotUploadFinishResponse(bool success,
+                                               quint64 mediaId,
                                                const QString &fileName,
                                                const QString &message)
 {
     if (!m_uploading)
         return;
 
-    if (!success) {
+    if (!success || mediaId == 0) {
         finishUploadState(false, QString("upload completion failed: %1").arg(message));
         return;
     }
 
     const QString savedName = fileName.isEmpty() ? m_uploadFileName : fileName;
-    finishUploadState(true, QString("upload completed: %1").arg(savedName));
+    finishUploadState(true, QString("upload completed: %1 (media_id=%2)")
+                      .arg(savedName)
+                      .arg(mediaId));
     slotRefreshClicked();
 }
 
@@ -460,6 +515,10 @@ void RemoteMediaPage::slotResumeUploadClicked()
                                  QString("Connect to %1:%2 first.")
                                  .arg(task.serverIp)
                                  .arg(task.serverPort));
+        return;
+    }
+    if (!m_networkClient->isAuthenticated()) {
+        QMessageBox::information(this, "Resume upload", "Please log in first.");
         return;
     }
     if (m_networkClient->serverIp() != task.serverIp ||
@@ -548,6 +607,7 @@ void RemoteMediaPage::slotSelectionChanged()
     m_selectedFileLabel->setText(fileName.isEmpty()
                                  ? "Selected: none"
                                  : QString("Selected: %1").arg(fileName));
+    updateActionStates();
 }
 
 void RemoteMediaPage::slotDownloadClicked()
@@ -583,6 +643,10 @@ void RemoteMediaPage::slotResumeDownloadClicked()
                                  .arg(task.serverPort));
         return;
     }
+    if (!m_networkClient->isAuthenticated()) {
+        QMessageBox::information(this, "Resume download", "Please log in first.");
+        return;
+    }
     if (m_networkClient->serverIp() != task.serverIp ||
             m_networkClient->serverPort() != task.serverPort) {
         QMessageBox::warning(this, "Resume download",
@@ -604,6 +668,7 @@ void RemoteMediaPage::slotResumeDownloadClicked()
     m_hasCurrentDownloadTask = true;
     m_currentDownloadTask = task;
     m_playAfterDownload = task.playAfterDownload;
+    m_downloadMediaId = task.mediaId;
     m_downloadFileName = task.remoteFileName;
     m_downloadPartPath = task.localPartPath;
     m_downloadFinalPath = task.localFinalPath;
@@ -618,7 +683,7 @@ void RemoteMediaPage::slotResumeDownloadClicked()
               .arg(m_downloadOffset)
               .arg(m_downloadFileName));
 
-    if (!m_networkClient->sendDownloadInit(m_downloadFileName,
+    if (!m_networkClient->sendDownloadInit(m_downloadMediaId,
                                            m_downloadOffset,
                                            m_downloadFileSize,
                                            m_downloadModifiedTime)) {
@@ -657,6 +722,7 @@ void RemoteMediaPage::slotAbandonDownloadClicked()
 }
 
 void RemoteMediaPage::slotDownloadInitResponse(bool success,
+                                               quint64 mediaId,
                                                const QString &fileName,
                                                qint64 fileSize,
                                                qint64 modifiedTime,
@@ -672,7 +738,7 @@ void RemoteMediaPage::slotDownloadInitResponse(bool success,
                             ? "remote file changed" : "waiting");
         return;
     }
-    if (fileName != m_downloadFileName || fileSize <= 0 ||
+    if (mediaId != m_downloadMediaId || fileName != m_downloadFileName || fileSize <= 0 ||
             modifiedTime <= 0 || acceptedOffset < 0 ||
             acceptedOffset > fileSize) {
         finishDownloadState(false, "server returned invalid download metadata");
@@ -736,6 +802,7 @@ void RemoteMediaPage::slotDownloadInitResponse(bool success,
 
         m_currentDownloadTask = DownloadTaskState();
         m_currentDownloadTask.taskId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        m_currentDownloadTask.mediaId = mediaId;
         m_currentDownloadTask.remoteFileName = fileName;
         m_currentDownloadTask.localPartPath = m_downloadPartPath;
         m_currentDownloadTask.localFinalPath = m_downloadFinalPath;
@@ -766,6 +833,7 @@ void RemoteMediaPage::slotDownloadInitResponse(bool success,
 }
 
 void RemoteMediaPage::slotDownloadBlockResponse(bool success,
+                                                quint64 mediaId,
                                                 const QString &fileName,
                                                 qint64 offset,
                                                 const QByteArray &data,
@@ -777,7 +845,7 @@ void RemoteMediaPage::slotDownloadBlockResponse(bool success,
         finishDownloadState(false, QString("download block failed: %1").arg(message));
         return;
     }
-    if (fileName != m_downloadFileName ||
+    if (mediaId != m_downloadMediaId || fileName != m_downloadFileName ||
             offset != m_downloadOffset ||
             data.isEmpty() ||
             data.size() > 64 * 1024 ||
@@ -808,7 +876,7 @@ void RemoteMediaPage::slotDownloadBlockResponse(bool success,
         m_downloadFile->flush();
         m_downloadFile->close();
         m_downloadStatusLabel->setText(QString("Finalizing %1").arg(m_downloadFileName));
-        if (!m_networkClient->sendDownloadFinish(m_downloadFileName,
+        if (!m_networkClient->sendDownloadFinish(m_downloadMediaId,
                                                  m_downloadFileSize)) {
             finishDownloadState(false, "failed to send download completion request");
         }
@@ -821,12 +889,13 @@ void RemoteMediaPage::slotDownloadBlockResponse(bool success,
 }
 
 void RemoteMediaPage::slotDownloadFinishResponse(bool success,
+                                                 quint64 mediaId,
                                                  const QString &fileName,
                                                  const QString &message)
 {
     if (!m_downloading)
         return;
-    if (!success || fileName != m_downloadFileName) {
+    if (!success || mediaId != m_downloadMediaId || fileName != m_downloadFileName) {
         finishDownloadState(false, QString("download completion failed: %1").arg(message));
         return;
     }
@@ -873,15 +942,19 @@ void RemoteMediaPage::fillTable(const QString &payload)
     const QStringList lines = payload.split('\n', QString::SkipEmptyParts);
     for (const QString &line : lines) {
         const QStringList fields = line.split('|');
-        if (fields.size() < 4) {
+        if (fields.size() < 8) {
             appendLog(QString("skip invalid media row: %1").arg(line));
             continue;
         }
 
         const int row = m_table->rowCount();
         m_table->insertRow(row);
-        for (int col = 0; col < 4; ++col)
-            m_table->setItem(row, col, new QTableWidgetItem(fields.at(col)));
+        m_table->setItem(row, 0, new QTableWidgetItem(fields.at(0)));
+        m_table->setItem(row, 1, new QTableWidgetItem(fields.at(3)));
+        m_table->setItem(row, 2, new QTableWidgetItem(fields.at(2)));
+        m_table->setItem(row, 3, new QTableWidgetItem(fields.at(4)));
+        m_table->setItem(row, 4, new QTableWidgetItem(fields.at(5)));
+        m_table->setItem(row, 5, new QTableWidgetItem(fields.at(6)));
     }
 
     appendLog(QString("loaded %1 media file(s)").arg(m_table->rowCount()));
@@ -1071,11 +1144,17 @@ void RemoteMediaPage::startDownload(bool playAfterDownload)
         QMessageBox::information(this, "Download media", "Please connect to server first.");
         return;
     }
+    if (!m_networkClient->isAuthenticated()) {
+        appendLog("please log in before downloading media");
+        QMessageBox::information(this, "Download media", "Please log in first.");
+        return;
+    }
     if (m_uploading || m_downloading)
         return;
 
+    const quint64 mediaId = selectedMediaId();
     const QString fileName = selectedMediaFile();
-    if (fileName.isEmpty()) {
+    if (mediaId == 0 || fileName.isEmpty()) {
         appendLog("please select a remote media file first");
         QMessageBox::information(this,
                                  "Download media",
@@ -1094,6 +1173,7 @@ void RemoteMediaPage::startDownload(bool playAfterDownload)
     m_resumingDownload = false;
     m_hasCurrentDownloadTask = false;
     m_playAfterDownload = playAfterDownload;
+    m_downloadMediaId = mediaId;
     m_downloadFileName = fileName;
     m_downloadFileSize = 0;
     m_downloadModifiedTime = 0;
@@ -1105,7 +1185,7 @@ void RemoteMediaPage::startDownload(bool playAfterDownload)
     updateActionStates();
     appendLog(QString("starting download: %1").arg(fileName));
 
-    if (!m_networkClient->sendDownloadInit(fileName, 0, 0, 0))
+    if (!m_networkClient->sendDownloadInit(mediaId, 0, 0, 0))
         finishDownloadState(false, "failed to send download initialization");
 }
 
@@ -1117,7 +1197,7 @@ void RemoteMediaPage::continueDownloadAfterInitialization()
         if (m_downloadFile->isOpen())
             m_downloadFile->close();
         m_downloadStatusLabel->setText(QString("Finalizing %1").arg(m_downloadFileName));
-        if (!m_networkClient->sendDownloadFinish(m_downloadFileName,
+        if (!m_networkClient->sendDownloadFinish(m_downloadMediaId,
                                                  m_downloadFileSize)) {
             finishDownloadState(false, "failed to send download completion request");
         }
@@ -1141,7 +1221,7 @@ void RemoteMediaPage::requestNextDownloadBlock()
     const qint64 remaining = m_downloadFileSize - m_downloadOffset;
     const int requestSize = static_cast<int>(qMin<qint64>(64 * 1024, remaining));
     if (requestSize <= 0 ||
-            !m_networkClient->sendDownloadBlock(m_downloadFileName,
+            !m_networkClient->sendDownloadBlock(m_downloadMediaId,
                                                 m_downloadOffset,
                                                 requestSize)) {
         finishDownloadState(false, "failed to request download block");
@@ -1172,6 +1252,7 @@ void RemoteMediaPage::finishDownloadState(bool success,
     m_hasCurrentDownloadTask = false;
     m_playAfterDownload = false;
     m_currentDownloadTask = DownloadTaskState();
+    m_downloadMediaId = 0;
     m_downloadFileName.clear();
     m_downloadPartPath.clear();
     m_downloadFinalPath.clear();
@@ -1329,8 +1410,17 @@ bool RemoteMediaPage::hasConflictingDownloadTask(const QString &fileName) const
 QString RemoteMediaPage::selectedMediaFile() const
 {
     const int row = m_table->currentRow();
-    QTableWidgetItem *item = row >= 0 ? m_table->item(row, 0) : nullptr;
+    QTableWidgetItem *item = row >= 0 ? m_table->item(row, 1) : nullptr;
     return item ? item->text() : QString();
+}
+
+quint64 RemoteMediaPage::selectedMediaId() const
+{
+    const int row = m_table->currentRow();
+    QTableWidgetItem *item = row >= 0 ? m_table->item(row, 0) : nullptr;
+    bool ok = false;
+    const quint64 mediaId = item ? item->text().toULongLong(&ok) : 0;
+    return ok ? mediaId : 0;
 }
 
 bool RemoteMediaPage::isSafeCacheFileName(const QString &fileName) const
@@ -1347,15 +1437,21 @@ bool RemoteMediaPage::isSafeCacheFileName(const QString &fileName) const
 void RemoteMediaPage::updateActionStates()
 {
     const bool connected = m_networkClient->isConnected();
+    const bool authenticated = m_networkClient->isAuthenticated();
     const bool transferBusy = m_uploading || m_downloading;
-    m_refreshButton->setEnabled(connected && !transferBusy);
-    m_uploadButton->setEnabled(!transferBusy);
-    m_downloadButton->setEnabled(!transferBusy);
-    m_downloadAndPlayButton->setEnabled(!transferBusy);
+    m_scopeCombo->setEnabled(authenticated && !transferBusy);
+    m_refreshButton->setEnabled(connected && authenticated && !transferBusy);
+    m_uploadButton->setEnabled(connected && authenticated && !transferBusy);
+    const bool mediaSelected = selectedMediaId() != 0;
+    m_downloadButton->setEnabled(connected && authenticated && mediaSelected && !transferBusy);
+    m_downloadAndPlayButton->setEnabled(
+                connected && authenticated && mediaSelected && !transferBusy);
     const bool uploadTaskSelected = m_uploadTaskTable->currentRow() >= 0;
-    m_resumeUploadButton->setEnabled(uploadTaskSelected && !transferBusy);
+    m_resumeUploadButton->setEnabled(
+                connected && authenticated && uploadTaskSelected && !transferBusy);
     m_abandonUploadButton->setEnabled(uploadTaskSelected && !transferBusy);
     const bool downloadTaskSelected = m_downloadTaskTable->currentRow() >= 0;
-    m_resumeDownloadButton->setEnabled(downloadTaskSelected && !transferBusy);
+    m_resumeDownloadButton->setEnabled(
+                connected && authenticated && downloadTaskSelected && !transferBusy);
     m_abandonDownloadButton->setEnabled(downloadTaskSelected && !transferBusy);
 }

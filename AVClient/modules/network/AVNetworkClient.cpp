@@ -28,7 +28,9 @@ bool copyUtf8Field(char *target, int capacity, const QString &value)
 AVNetworkClient::AVNetworkClient(QObject *parent)
     : QObject(parent),
       m_tcpClient(new TcpClient(this)),
-      m_serverPort(0)
+      m_serverPort(0),
+      m_authenticated(false),
+      m_currentUserId(0)
 {
     connect(m_tcpClient, SIGNAL(connected()), this, SLOT(onConnected()));
     connect(m_tcpClient, SIGNAL(connectFailed(QString)), this, SLOT(onConnectFailed(QString)));
@@ -71,19 +73,42 @@ bool AVNetworkClient::sendPing()
 bool AVNetworkClient::sendLogin(const QString &username, const QString &password)
 {
     STRU_LOGIN_RQ rq;
-    QByteArray user = username.toUtf8();
-    QByteArray pwd = password.toUtf8();
-    strncpy(rq.username, user.constData(), AV_NAME_SIZE - 1);
-    strncpy(rq.password, pwd.constData(), AV_NAME_SIZE - 1);
+    if (!copyUtf8Field(rq.username, sizeof(rq.username), username) ||
+            !copyUtf8Field(rq.password, sizeof(rq.password), password)) {
+        emit logMessage("failed to send LOGIN_RQ: credentials are too long");
+        return false;
+    }
 
     bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
     emit logMessage(ok ? "sent LOGIN_RQ" : "failed to send LOGIN_RQ");
     return ok;
 }
 
-bool AVNetworkClient::sendMediaListRequest()
+bool AVNetworkClient::sendRegister(const QString &username, const QString &password)
+{
+    STRU_REGISTER_RQ rq;
+    if (!copyUtf8Field(rq.username, sizeof(rq.username), username) ||
+            !copyUtf8Field(rq.password, sizeof(rq.password), password)) {
+        emit logMessage("failed to send REGISTER_RQ: credentials are too long");
+        return false;
+    }
+    const bool ok = m_tcpClient->sendPacket(
+                reinterpret_cast<const char *>(&rq), sizeof(rq));
+    emit logMessage(ok ? "sent REGISTER_RQ" : "failed to send REGISTER_RQ");
+    return ok;
+}
+
+bool AVNetworkClient::sendMediaListRequest(int scope, int page, int pageSize,
+                                           const QString &keyword)
 {
     STRU_MEDIA_LIST_RQ rq;
+    if (!copyUtf8Field(rq.keyword, sizeof(rq.keyword), keyword)) {
+        emit logMessage("failed to send MEDIA_LIST_RQ: keyword is too long");
+        return false;
+    }
+    rq.scope = scope;
+    rq.page = page;
+    rq.pageSize = pageSize;
     bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
     emit logMessage(ok ? "sent MEDIA_LIST_RQ" : "failed to send MEDIA_LIST_RQ");
     return ok;
@@ -171,16 +196,17 @@ bool AVNetworkClient::sendUploadFinish(const QString &transferId,
     return ok;
 }
 
-bool AVNetworkClient::sendDownloadInit(const QString &fileName,
+bool AVNetworkClient::sendDownloadInit(quint64 mediaId,
                                        qint64 resumeOffset,
                                        qint64 expectedFileSize,
                                        qint64 expectedModifiedTime)
 {
     STRU_DOWNLOAD_INIT_RQ rq;
-    if (!copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
-        emit logMessage("failed to send DOWNLOAD_INIT_RQ: file name is too long");
+    if (mediaId == 0) {
+        emit logMessage("failed to send DOWNLOAD_INIT_RQ: invalid media id");
         return false;
     }
+    rq.mediaId = mediaId;
     rq.resumeOffset = resumeOffset;
     rq.expectedFileSize = expectedFileSize;
     rq.expectedModifiedTime = expectedModifiedTime;
@@ -190,7 +216,7 @@ bool AVNetworkClient::sendDownloadInit(const QString &fileName,
     return ok;
 }
 
-bool AVNetworkClient::sendDownloadBlock(const QString &fileName,
+bool AVNetworkClient::sendDownloadBlock(quint64 mediaId,
                                         qint64 offset,
                                         int requestSize)
 {
@@ -200,10 +226,11 @@ bool AVNetworkClient::sendDownloadBlock(const QString &fileName,
     }
 
     STRU_DOWNLOAD_BLOCK_RQ rq;
-    if (!copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
-        emit logMessage("failed to send DOWNLOAD_BLOCK_RQ: file name is too long");
+    if (mediaId == 0) {
+        emit logMessage("failed to send DOWNLOAD_BLOCK_RQ: invalid media id");
         return false;
     }
+    rq.mediaId = mediaId;
     rq.offset = offset;
     rq.requestSize = requestSize;
 
@@ -213,13 +240,14 @@ bool AVNetworkClient::sendDownloadBlock(const QString &fileName,
     return ok;
 }
 
-bool AVNetworkClient::sendDownloadFinish(const QString &fileName, qint64 fileSize)
+bool AVNetworkClient::sendDownloadFinish(quint64 mediaId, qint64 fileSize)
 {
     STRU_DOWNLOAD_FINISH_RQ rq;
-    if (!copyUtf8Field(rq.fileName, sizeof(rq.fileName), fileName)) {
-        emit logMessage("failed to send DOWNLOAD_FINISH_RQ: file name is too long");
+    if (mediaId == 0) {
+        emit logMessage("failed to send DOWNLOAD_FINISH_RQ: invalid media id");
         return false;
     }
+    rq.mediaId = mediaId;
     rq.fileSize = fileSize;
 
     const bool ok = m_tcpClient->sendPacket(reinterpret_cast<const char *>(&rq), sizeof(rq));
@@ -242,20 +270,47 @@ quint16 AVNetworkClient::serverPort() const
     return m_serverPort;
 }
 
+bool AVNetworkClient::isAuthenticated() const
+{
+    return m_authenticated;
+}
+
+quint64 AVNetworkClient::currentUserId() const
+{
+    return m_currentUserId;
+}
+
+QString AVNetworkClient::currentUsername() const
+{
+    return m_currentUsername;
+}
+
 void AVNetworkClient::onConnected()
 {
+    m_authenticated = false;
+    m_currentUserId = 0;
+    m_currentUsername.clear();
+    emit authenticationChanged(false, 0, QString());
     emit connectedChanged(true);
     emit logMessage("connected");
 }
 
 void AVNetworkClient::onConnectFailed(const QString &reason)
 {
+    m_authenticated = false;
+    m_currentUserId = 0;
+    m_currentUsername.clear();
+    emit authenticationChanged(false, 0, QString());
     emit connectedChanged(false);
     emit logMessage(QString("connect failed: %1").arg(reason));
 }
 
 void AVNetworkClient::onDisconnected()
 {
+    m_authenticated = false;
+    m_currentUserId = 0;
+    m_currentUsername.clear();
+    emit authenticationChanged(false, 0, QString());
     emit connectedChanged(false);
     emit logMessage("disconnected");
 }
@@ -283,16 +338,38 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         emit pingResponse(message);
         break;
     }
+    case DEF_PACK_REGISTER_RS:
+    {
+        if (packet.size() != static_cast<int>(sizeof(STRU_REGISTER_RS))) {
+            emit logMessage("received invalid REGISTER_RS");
+            return;
+        }
+        STRU_REGISTER_RS rs;
+        memcpy(&rs, packet.constData(), sizeof(rs));
+        const QString message = utf8Field(rs.message, sizeof(rs.message));
+        emit logMessage(QString("received REGISTER_RS: %1").arg(message));
+        emit registerResponse(rs.result != 0, rs.errorCode, rs.userId, message);
+        break;
+    }
     case DEF_PACK_LOGIN_RS:
     {
         if (packet.size() < static_cast<int>(sizeof(STRU_LOGIN_RS))) {
             emit logMessage("received short LOGIN_RS");
             return;
         }
-        const STRU_LOGIN_RS *rs = reinterpret_cast<const STRU_LOGIN_RS *>(packet.constData());
-        QString message = QString::fromLocal8Bit(rs->message);
+        STRU_LOGIN_RS rs;
+        memcpy(&rs, packet.constData(), sizeof(rs));
+        const QString message = utf8Field(rs.message, sizeof(rs.message));
+        const QString username = utf8Field(rs.username, sizeof(rs.username));
         emit logMessage(QString("received LOGIN_RS: %1").arg(message));
-        emit loginResponse(rs->result != 0, message);
+        if (rs.result != 0) {
+            m_authenticated = true;
+            m_currentUserId = rs.userId;
+            m_currentUsername = username;
+            emit authenticationChanged(true, m_currentUserId, m_currentUsername);
+        }
+        emit loginResponse(rs.result != 0, rs.errorCode, rs.userId,
+                           username, message);
         break;
     }
     case DEF_PACK_MEDIA_LIST_RS:
@@ -311,8 +388,9 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
 
         QByteArray payload = packet.mid(sizeof(STRU_MEDIA_LIST_RS_HEADER), header->payloadSize);
         QString text = QString::fromUtf8(payload);
-        emit logMessage(QString("received MEDIA_LIST_RS: %1 bytes").arg(header->payloadSize));
-        emit mediaListReceived(text);
+        const QString message = utf8Field(header->message, sizeof(header->message));
+        emit logMessage(QString("received MEDIA_LIST_RS: %1").arg(message));
+        emit mediaListResponse(header->result != 0, text, message);
         break;
     }
     case DEF_PACK_UPLOAD_INIT_RS:
@@ -384,7 +462,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         const QString fileName = utf8Field(rs.fileName, sizeof(rs.fileName));
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         emit logMessage(QString("received UPLOAD_FINISH_RS: %1").arg(message));
-        emit uploadFinishResponse(rs.result != 0, fileName, message);
+        emit uploadFinishResponse(rs.result != 0, rs.mediaId, fileName, message);
         break;
     }
     case DEF_PACK_DOWNLOAD_INIT_RS:
@@ -392,6 +470,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         if (packet.size() != static_cast<int>(sizeof(STRU_DOWNLOAD_INIT_RS))) {
             emit logMessage("received invalid DOWNLOAD_INIT_RS");
             emit downloadInitResponse(false,
+                                      0,
                                       QString(),
                                       0,
                                       0,
@@ -405,6 +484,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         emit logMessage(QString("received DOWNLOAD_INIT_RS: %1").arg(message));
         emit downloadInitResponse(rs.result != 0,
+                                  rs.mediaId,
                                   fileName,
                                   rs.fileSize,
                                   rs.modifiedTime,
@@ -417,6 +497,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         if (packet.size() < static_cast<int>(sizeof(STRU_DOWNLOAD_BLOCK_RS_HEADER))) {
             emit logMessage("received short DOWNLOAD_BLOCK_RS");
             emit downloadBlockResponse(false,
+                                       0,
                                        QString(),
                                        0,
                                        QByteArray(),
@@ -430,6 +511,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
                 packet.size() != static_cast<int>(sizeof(rs) + rs.dataSize)) {
             emit logMessage("received invalid DOWNLOAD_BLOCK_RS payload");
             emit downloadBlockResponse(false,
+                                       rs.mediaId,
                                        QString(),
                                        rs.offset,
                                        QByteArray(),
@@ -441,6 +523,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         const QByteArray data = packet.mid(sizeof(rs), rs.dataSize);
         emit downloadBlockResponse(rs.result != 0,
+                                   rs.mediaId,
                                    fileName,
                                    rs.offset,
                                    data,
@@ -452,6 +535,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         if (packet.size() != static_cast<int>(sizeof(STRU_DOWNLOAD_FINISH_RS))) {
             emit logMessage("received invalid DOWNLOAD_FINISH_RS");
             emit downloadFinishResponse(false,
+                                         0,
                                          QString(),
                                          "invalid DOWNLOAD_FINISH_RS");
             return;
@@ -461,7 +545,7 @@ void AVNetworkClient::onPacketReceived(const QByteArray &packet)
         const QString fileName = utf8Field(rs.fileName, sizeof(rs.fileName));
         const QString message = utf8Field(rs.message, sizeof(rs.message));
         emit logMessage(QString("received DOWNLOAD_FINISH_RS: %1").arg(message));
-        emit downloadFinishResponse(rs.result != 0, fileName, message);
+        emit downloadFinishResponse(rs.result != 0, rs.mediaId, fileName, message);
         break;
     }
     default:

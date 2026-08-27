@@ -84,6 +84,7 @@ bool UploadManager::initialize()
 }
 
 bool UploadManager::createUpload(uint64_t ownerConnectionId,
+                                 uint64_t ownerUserId,
                                  const std::string &fileName,
                                  const std::string &extension,
                                  int64_t fileSize,
@@ -96,6 +97,10 @@ bool UploadManager::createUpload(uint64_t ownerConnectionId,
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!transferId || !resumeToken || !resumeOffset || !finalFileName || !message)
         return false;
+    if (ownerUserId == 0) {
+        *message = "permission denied";
+        return false;
+    }
     if (!ensureDirectories()) {
         *message = "failed to create upload directories";
         return false;
@@ -119,7 +124,7 @@ bool UploadManager::createUpload(uint64_t ownerConnectionId,
     task.transferId = makeTransferId();
     task.resumeToken = makeResumeToken();
     task.originalFileName = fileName;
-    task.finalFileName = makeAvailableFileName(fileName);
+    task.finalFileName = task.transferId + "." + ext;
     task.extension = ext;
     task.tempPath = m_tempDir + "/" + task.transferId + ".part";
     task.expectedSize = fileSize;
@@ -127,6 +132,7 @@ bool UploadManager::createUpload(uint64_t ownerConnectionId,
     task.createdTime = std::time(nullptr);
     task.updatedTime = task.createdTime;
     task.status = "uploading";
+    task.ownerUserId = ownerUserId;
     task.activeOwnerConnectionId = ownerConnectionId;
 
     const int partFd = open(task.tempPath.c_str(),
@@ -154,6 +160,7 @@ bool UploadManager::createUpload(uint64_t ownerConnectionId,
 }
 
 bool UploadManager::resumeUpload(uint64_t ownerConnectionId,
+                                 uint64_t ownerUserId,
                                  const std::string &transferId,
                                  const std::string &resumeToken,
                                  const std::string &fileName,
@@ -177,6 +184,14 @@ bool UploadManager::resumeUpload(uint64_t ownerConnectionId,
     UploadTask &task = it->second;
     if (!secureEquals(task.resumeToken, resumeToken)) {
         *message = "token invalid";
+        return false;
+    }
+    if (task.ownerUserId == 0) {
+        *message = "legacy upload task has no ownerUserId";
+        return false;
+    }
+    if (task.ownerUserId != ownerUserId) {
+        *message = "permission denied";
         return false;
     }
     if (task.originalFileName != fileName || task.expectedSize != expectedSize) {
@@ -226,6 +241,7 @@ bool UploadManager::resumeUpload(uint64_t ownerConnectionId,
 }
 
 bool UploadManager::writeBlock(uint64_t ownerConnectionId,
+                               uint64_t ownerUserId,
                                const std::string &transferId,
                                int64_t offset,
                                const char *data,
@@ -248,6 +264,10 @@ bool UploadManager::writeBlock(uint64_t ownerConnectionId,
     *receivedOffset = task.receivedSize;
     if (task.status != "uploading") {
         *message = "task is not uploading";
+        return false;
+    }
+    if (task.ownerUserId != ownerUserId) {
+        *message = "permission denied";
         return false;
     }
     if (task.activeOwnerConnectionId != ownerConnectionId) {
@@ -329,15 +349,19 @@ bool UploadManager::writeBlock(uint64_t ownerConnectionId,
 }
 
 bool UploadManager::finishUpload(uint64_t ownerConnectionId,
+                                 uint64_t ownerUserId,
                                  const std::string &transferId,
                                  const std::string &fileName,
                                  int64_t fileSize,
+                                 const MediaPublisher &publisher,
                                  std::string *savedFileName,
+                                 uint64_t *mediaId,
                                  std::string *message)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!savedFileName || !message)
+    std::unique_lock<std::mutex> lock(m_mutex);
+    if (!savedFileName || !mediaId || !message || !publisher)
         return false;
+    *mediaId = 0;
     std::map<std::string, UploadTask>::iterator it = m_tasks.find(transferId);
     if (it == m_tasks.end()) {
         *message = "task not found";
@@ -345,6 +369,10 @@ bool UploadManager::finishUpload(uint64_t ownerConnectionId,
     }
 
     UploadTask &task = it->second;
+    if (task.ownerUserId != ownerUserId) {
+        *message = "permission denied";
+        return false;
+    }
     if (task.activeOwnerConnectionId != ownerConnectionId) {
         *message = "task is not bound to this connection";
         return false;
@@ -363,28 +391,61 @@ bool UploadManager::finishUpload(uint64_t ownerConnectionId,
         return false;
     }
 
-    if (pathExists(m_mediaDir + "/" + task.finalFileName)) {
-        task.finalFileName = makeAvailableFileName(task.originalFileName,
-                                                   task.transferId);
-        task.updatedTime = std::time(nullptr);
-        if (!persistTask(task)) {
-            *message = "failed to persist final file name";
-            return false;
-        }
-    }
-
     const std::string finalPath = m_mediaDir + "/" + task.finalFileName;
+    if (pathExists(finalPath)) {
+        *message = "stored media file already exists";
+        return false;
+    }
     if (std::rename(task.tempPath.c_str(), finalPath.c_str()) != 0) {
         *message = "failed to move file to media directory";
         return false;
     }
 
+    CompletedUpload completed;
+    completed.ownerUserId = task.ownerUserId;
+    completed.originalFileName = task.originalFileName;
+    completed.storedFileName = task.finalFileName;
+    completed.storagePath = finalPath;
+    completed.extension = task.extension;
+    completed.fileSize = task.expectedSize;
+    task.status = "publishing";
+    const std::string completedTransferId = task.transferId;
+    const std::string completedTaskPath = taskPath(task.transferId);
     const std::string completedName = task.finalFileName;
-    if (std::remove(taskPath(task.transferId).c_str()) != 0 && errno != ENOENT) {
-        std::printf("warning: failed to remove completed task metadata transfer_id=%s errno=%d\n",
-                    task.transferId.c_str(), errno);
+    const std::string rollbackPath = task.tempPath;
+    lock.unlock();
+
+    std::string publishMessage;
+    if (!publisher(completed, mediaId, &publishMessage)) {
+        const bool rolledBack = std::rename(finalPath.c_str(), rollbackPath.c_str()) == 0;
+        lock.lock();
+        std::map<std::string, UploadTask>::iterator failedIt =
+                m_tasks.find(completedTransferId);
+        if (failedIt != m_tasks.end()) {
+            failedIt->second.status = rolledBack ? "uploading" : "failed";
+            failedIt->second.updatedTime = std::time(nullptr);
+            if (rolledBack && !persistTask(failedIt->second)) {
+                std::printf("warning: failed to persist rolled back upload transfer_id=%s\n",
+                            completedTransferId.c_str());
+            }
+        }
+        if (!rolledBack) {
+            std::printf("critical: failed to roll back media file transfer_id=%s\n",
+                        completedTransferId.c_str());
+            *message = "database publish failed and file rollback failed";
+        } else {
+            *message = publishMessage.empty()
+                    ? "database temporarily unavailable" : publishMessage;
+        }
+        return false;
     }
-    m_tasks.erase(it);
+
+    lock.lock();
+    if (std::remove(completedTaskPath.c_str()) != 0 && errno != ENOENT) {
+        std::printf("warning: failed to remove completed task metadata transfer_id=%s errno=%d\n",
+                    completedTransferId.c_str(), errno);
+    }
+    m_tasks.erase(completedTransferId);
     *savedFileName = completedName;
     *message = "upload completed";
     return true;
@@ -548,6 +609,20 @@ bool UploadManager::loadTaskFile(const std::string &path,
     task->createdTime = static_cast<std::time_t>(created);
     task->updatedTime = static_cast<std::time_t>(updated);
     task->extension = extensionOf(task->originalFileName);
+    task->ownerUserId = 0;
+    std::map<std::string, std::string>::const_iterator ownerIt =
+            fields.find("owner_user_id");
+    if (ownerIt != fields.end()) {
+        int64_t owner = 0;
+        if (!parseInt64(ownerIt->second, &owner) || owner < 0) {
+            *error = "invalid owner metadata";
+            return false;
+        }
+        task->ownerUserId = static_cast<uint64_t>(owner);
+    } else {
+        std::printf("legacy upload task has no ownerUserId transfer_id=%s\n",
+                    task->transferId.c_str());
+    }
     task->activeOwnerConnectionId = 0;
 
     const std::string expectedTempPath = m_tempDir + "/" + task->transferId + ".part";
@@ -582,6 +657,7 @@ bool UploadManager::persistTask(const UploadTask &task) const
             << "created_time=" << static_cast<long long>(task.createdTime) << "\n"
             << "updated_time=" << static_cast<long long>(task.updatedTime) << "\n"
             << "status=" << task.status << "\n";
+    content << "owner_user_id=" << task.ownerUserId << "\n";
 
     const std::string finalPath = taskPath(task.transferId);
     const std::string temporaryPath = finalPath + ".tmp";
@@ -663,7 +739,8 @@ bool UploadManager::isSafeFileName(const std::string &fileName) const
     if (fileName.find('/') != std::string::npos ||
             fileName.find('\\') != std::string::npos ||
             fileName.find("..") != std::string::npos ||
-            fileName.find('=') != std::string::npos) {
+            fileName.find('=') != std::string::npos ||
+            fileName.find('|') != std::string::npos) {
         return false;
     }
     for (std::string::const_iterator it = fileName.begin(); it != fileName.end(); ++it) {

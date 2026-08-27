@@ -9,7 +9,8 @@
 #include <QSaveFile>
 
 DownloadTaskState::DownloadTaskState()
-    : serverPort(0),
+    : mediaId(0),
+      serverPort(0),
       expectedFileSize(0),
       expectedModifiedTime(0),
       confirmedOffset(0),
@@ -51,6 +52,7 @@ QList<DownloadTaskState> DownloadTaskStore::loadAll(QStringList *warnings) const
         const QJsonObject object = document.object();
         DownloadTaskState task;
         task.taskId = object.value("task_id").toString();
+        task.mediaId = object.value("media_id").toString().toULongLong();
         task.remoteFileName = object.value("remote_filename").toString();
         task.localPartPath = object.value("local_part_path").toString();
         task.localFinalPath = object.value("local_final_path").toString();
@@ -92,8 +94,9 @@ bool DownloadTaskStore::save(const DownloadTaskState &task, QString *error) cons
     }
 
     QJsonObject object;
-    object.insert("version", 1);
+    object.insert("version", 2);
     object.insert("task_id", task.taskId);
+    object.insert("media_id", QString::number(task.mediaId));
     object.insert("remote_filename", task.remoteFileName);
     object.insert("local_part_path", task.localPartPath);
     object.insert("local_final_path", task.localFinalPath);
@@ -144,6 +147,7 @@ QString DownloadTaskStore::stateDirectory() const
 bool DownloadTaskStore::isValidTask(const DownloadTaskState &task) const
 {
     return isValidTaskId(task.taskId) &&
+            task.mediaId != 0 &&
             isSafeRemoteFileName(task.remoteFileName) &&
             hasExpectedCachePaths(task) &&
             !task.serverIp.isEmpty() &&

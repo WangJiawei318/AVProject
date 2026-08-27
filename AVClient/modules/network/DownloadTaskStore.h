@@ -10,6 +10,7 @@ struct DownloadTaskState
     DownloadTaskState();
 
     QString taskId;
+    quint64 mediaId;
     QString remoteFileName;
     QString localPartPath;
     QString localFinalPath;

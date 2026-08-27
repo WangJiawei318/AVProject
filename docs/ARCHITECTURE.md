@@ -18,7 +18,7 @@ AVProject 是典型的客户端/服务端系统。
 ┌──────────────── Windows ────────────────┐
 │ AVClient                               │
 │                                        │
-│ Player  Recorder  Remote  Settings     │
+│ Player Recorder Account Remote Settings│
 │    │       │        │        │         │
 │    └───────┴────────┴────────┘         │
 │              MainWindow                │
@@ -34,9 +34,9 @@ AVProject 是典型的客户端/服务端系统。
 │               AVServer                 │
 │          ┌───────┼────────┐            │
 │          ▼       ▼        ▼            │
-│ MediaManager UploadManager DownloadManager
-│          │       │        │            │
-│        media/  temp/     media/         │
+│ AuthService UploadManager DownloadManager
+│      │          │        │             │
+│    MySQL      temp/     media/          │
 │                ├─ *.part                │
 │                └─ tasks/*.task          │
 └────────────────────────────────────────┘
@@ -73,6 +73,7 @@ AVClient/ + AVServer/
 | --- | --- | --- |
 | `PlayerPage` | 本地文件、URL 和下载缓存播放 | `PlayerDialog` |
 | `RecorderPage` | 桌面、摄像头、麦克风录制 | `RecorderDialog` |
+| `AuthPage` | 注册、登录、显示当前连接身份 | `AVNetworkClient` |
 | `RemoteMediaPage` | 列表、可恢复上传/下载、进度 | `AVNetworkClient`、`UploadTaskStore`、`DownloadTaskStore` |
 | `SettingsPage` | IP、端口、连接、断开、Ping | `AVNetworkClient` |
 
@@ -88,7 +89,7 @@ MainWindow
        └── TcpClient
 ```
 
-`SettingsPage` 和 `RemoteMediaPage` 拿到同一个指针。这样整个客户端只有一个 TCP 连接和一个接收线程。
+`SettingsPage`、`AuthPage` 和 `RemoteMediaPage` 拿到同一个指针。这样整个客户端只有一个 TCP 连接、一个接收线程和一份 UI 认证状态。客户端保存的 userId 只用于显示；服务端授权只信任 `ConnectionContext.userId`。
 
 ### 4.3 网络线程与 UI
 
@@ -216,21 +217,15 @@ Winsock TCP
 
 ## 8. 远程媒体库模块
 
-### 8.1 MediaManager
+### 8.1 MediaRepository
 
-`MediaManager`：
+阶段 11 后，`MediaRepository` 通过连接池借用独立 `MYSQL*`，使用 Prepared Statement 查询 `media` 表。PUBLIC 返回所有 `status='published'` 的记录，MINE 额外限制 `owner_user_id = ConnectionContext.userId`。客户端收到 UTF-8 文本 payload 后按行和 `|` 拆分，表格显示 media ID、原始文件名、上传者、大小、类型和上传时间。
 
-- 确保 `media/` 存在；
-- 扫描普通文件；
-- 过滤支持的媒体后缀；
-- 获取文件大小和修改时间；
-- 生成 `filename|size|mtime|extension` 文本列表。
+磁盘 `media/` 只保存文件本体，不再通过扫描目录决定业务归属。没有数据库记录的历史文件不会出现在列表中；系统不会猜测这些 legacy media 属于哪个用户。
 
-客户端收到列表后按换行拆记录、按 `|` 拆字段，并填入 `QTableWidget`。
+### 8.2 为什么数据库不保存视频本体
 
-### 8.2 为什么第一版不用数据库
-
-目录扫描已经能完成最小媒体列表，部署时不需要数据库服务、账号、表结构和迁移。缺点是大目录效率、分页、标签和复杂搜索能力有限。数据库适合在基本闭环稳定后引入。
+MySQL 保存用户和媒体元数据，视频仍保存在文件系统。这样大文件传输继续使用 64 KB 文件 I/O，不让数据库承担大 BLOB、备份膨胀和昂贵随机读；数据库则负责唯一用户、所有者、列表条件和稳定 `mediaId`。
 
 ## 9. 上传模块
 
@@ -259,11 +254,14 @@ Winsock TCP
 服务端 `UploadManager` 保存：
 
 - `transfer_id` 和随机 `resume_token`；
+- 永久业务所有者 `owner_user_id`；
 - 原文件名、最终文件名和扩展名；
 - 预期大小和服务端已可靠写入大小；
 - `temp/<transfer_id>.part` 路径；
 - 创建、更新时间和任务状态；
 - 仅在内存中存在的 `active_owner_connection_id`。
+
+`owner_user_id` 来自服务端连接身份并写入 `.task`，重连后仍不变；`active_owner_connection_id` 只表示当前哪条 TCP 连接排他操作任务，不持久化。恢复时必须同时满足 token、文件信息和当前登录 userId。旧任务没有 owner 字段时按 0 加载并拒绝恢复，绝不自动绑定给当前用户。
 
 每个任务还对应 `temp/tasks/<transfer_id>.task`。新建任务和每次分片落盘后都会把元数据先写到临时元数据文件，再 `rename` 覆盖正式任务文件。服务器重启时扫描该目录，将未完成任务重新装入内存。
 
@@ -281,9 +279,9 @@ AVClient 重启后会重新加载这些文件并显示在“未完成上传任�
 
 ### 9.5 任务身份与连接绑定
 
-`transfer_id` 用于定位任务，`resume_token` 用于证明调用方持有恢复凭据。当前还没有用户系统，所以 token 是临时能力凭据，不等同于账号权限。
+`transfer_id` 用于定位任务，`resume_token` 用于证明调用方持有恢复凭据，`owner_user_id` 再把任务绑定到真实登录用户。三者联合校验可阻止其他账号恢复任务；没有 TLS 时 token 仍可能在链路上被监听，因此它不是公网级授权方案。
 
-socket fd 会在重连后变化，还可能被内核复用，服务端重启后也完全失效，因此不能作为永久任务身份。`active_owner_connection_id` 只表示“当前哪条连接正在操作此任务”：创建或恢复成功时绑定，连接关闭时解绑，同一时刻不允许另一连接恢复；解绑不会删除任务、元数据或 `.part`。connectionId 也不会被持久化，永久恢复凭证仍是 transfer ID 与 resume token。
+socket fd 会在重连后变化，还可能被内核复用，服务端重启后也完全失效，因此不能作为永久任务身份。`active_owner_connection_id` 只表示“当前哪条连接正在操作此任务”：创建或恢复成功时绑定，连接关闭时解绑，同一时刻不允许另一连接恢复；解绑不会删除任务、元数据或 `.part`。connectionId 也不会被持久化，恢复身份由 owner user ID、transfer ID 与 resume token 共同确定。
 
 ## 10. 下载模块
 
@@ -320,7 +318,7 @@ socket fd 会在重连后变化，还可能被内核复用，服务端重启后�
 - resume offset 不超过当前文件大小；
 - offset 和 request size 合法。
 
-随后只读取当前请求的最多 64 KB。`DownloadManager` 不保存下载任务、token 或文件游标，每个 BLOCK 都按 `filename + offset` 独立读取，因此服务端重启后无需恢复下载内存状态。
+随后只读取当前请求的最多 64 KB。worker 先按 `mediaId` 从 MySQL 取得可信 `stored_name`，`DownloadManager` 不保存下载任务、token 或文件游标，每个 BLOCK 都按该内部文件名和 offset 独立读取，因此服务端重启后无需恢复下载内存状态。
 
 ### 10.3 cache 和 .part
 
@@ -406,7 +404,7 @@ main()
 
 当前服务器采用单线程 Reactor + 有界动态业务线程池。一个 epoll 实例同时关注 listen fd、eventfd 和所有 client fd。每个连接都有独立 `ConnectionContext`，因此某个连接等待网络数据、发生半包或发送暂时不可写时，不会阻止服务器处理其他已就绪连接。
 
-Reactor 独占 socket I/O、epoll_ctl、连接和发送队列；4 至 8 个 worker 并行执行媒体目录扫描、上传元数据与文件写入、下载文件读取和业务响应生成。任务队列上限 256，非核心 worker 空闲 60 秒退出。文件 I/O 仍是同步调用，只是从 Reactor 移到 worker，因此它改善了连接响应隔离，但不是异步 I/O 或生产级无限并发。
+Reactor 独占 socket I/O、epoll_ctl、连接、认证状态和发送队列；4 至 8 个 worker 并行执行 MySQL、Argon2id、媒体查询、上传元数据与文件写入、下载读取和业务响应生成。任务队列上限 256，非核心 worker 空闲 60 秒退出。数据库和文件 I/O 仍是同步调用，只是从 Reactor 移到 worker，因此它改善了连接响应隔离，但不是异步 I/O 或生产级无限并发。
 
 ### 14.3 ConnectionContext
 
@@ -426,15 +424,17 @@ Reactor 独占 socket I/O、epoll_ctl、连接和发送队列；4 至 8 个 work
 
 ### 14.4 协议与业务层
 
-`ProtocolDispatcher` 持有 `MediaManager`、`UploadManager` 和 `DownloadManager`。它接收已经去掉长度头的完整包体，校验具体结构大小，调用业务管理器，再把一个或多个响应包体交还给网络层。这样 `EpollServer` 不理解媒体业务，业务管理器也不依赖 epoll。
+`ProtocolDispatcher` 持有 `DatabaseConnectionPool`、`AuthService`、`MediaRepository`、`UploadManager` 和 `DownloadManager`。它接收已经去掉长度头的完整包体，校验具体结构大小，调用业务服务，再把响应包体交还给网络层。这样 `EpollServer` 不理解 SQL 或媒体细节，业务组件也不依赖 epoll。
 
-PING/LOGIN 可由 Reactor 直接调用 Dispatcher；媒体列表及上传、下载协议由 worker 调用。Dispatcher 不直接 send、不调用 epoll_ctl，也不接收 ConnectionContext。
+只有 PING 可以在 Reactor 直接分发。REGISTER、LOGIN、媒体列表及上传下载协议全部进入 worker，因此 MySQL、Argon2id 和文件 I/O 不阻塞 Reactor。Dispatcher 不直接 send、不调用 epoll_ctl，也不持有 ConnectionContext 指针。
 
-上传任务的持久身份仍是 `transfer_id + resume_token`，当前会话排他绑定改为 `active_owner_connection_id`。UploadManager 用一把 mutex 保护任务 map、偏移、重名、绑定和过期清理。下载继续使用 `filename + offset + request_size` 无状态读取，不建立服务端下载任务，也不共享文件游标。
+上传任务使用 `userId + transfer_id + resume_token` 恢复，当前会话排他绑定是 `active_owner_connection_id`。UploadManager 用一把 mutex 保护任务 map、偏移、绑定和过期清理。下载使用 `mediaId + offset + request_size` 无状态读取，不建立服务端下载任务，也不共享文件游标。
 
 ### 14.5 completionQueue 与 eventfd
 
 worker 生成 `CompletedTask` 后，在 mutex 下移动到 completion queue，再向唯一 eventfd 写 1。Reactor 被 epoll 唤醒，批量 swap 出结果，按 connectionId 查找当前连接。连接已关闭或 fd 已复用时丢弃 completion；连接仍有效时才清除 in-flight、排队响应并继续解析缓存。
+
+登录成功的 completion 额外携带 `hasAuthUpdate/authenticatedUserId/authenticatedUsername`。Reactor 先确认 connectionId 仍对应当前连接并成功排队响应，再更新 `ConnectionContext`。worker 只处理身份值，不持有或修改连接对象，因此旧 fd 复用不会把用户身份写到新连接。
 
 工作线程不持有 ConnectionContext 指针，因此断开不会产生悬空访问。断开时和迟到 completion 被丢弃时都会尝试解除上传会话绑定，覆盖“INIT 在断开回调之后才完成”的竞态。
 
@@ -453,10 +453,12 @@ worker 生成 `CompletedTask` 后，在 mutex 下移动到 completion queue，�
 | 完成通知 | completion queue + 单 eventfd | worker 不直接操作 socket 或 epoll |
 | 同连接顺序 | 一个 business task in-flight | 保证上传分片和响应顺序 |
 | 文件 I/O | worker 内同步 64 KB 读写 | 隔离 Reactor，但尚非异步 I/O |
-| 媒体索引 | 扫描目录 | 不依赖 MySQL |
+| 媒体索引 | MySQL `media` 表 | 支持稳定 ID、归属和 PUBLIC/MINE |
+| 用户认证 | MySQL + Argon2id | 密码不明文落库，身份绑定连接 |
+| DB 并发 | 固定 4 连接池 | worker 独占借用，2.5 秒有限等待 |
 | 传输方式 | 64 KB 串行 ACK | 状态简单、内存固定 |
 | 上传落盘 | temp 后提交 | 不暴露半成品 |
-| 上传恢复身份 | transfer_id + resume_token | fd 变化后仍可恢复，并阻止只猜 ID 的客户端 |
+| 上传恢复身份 | userId + transfer_id + resume_token | 重连可恢复，同时阻止跨用户操作 |
 | 上传状态 | 客户端 JSON + 服务端键值元数据 | 不引入数据库即可跨进程恢复 |
 | 下载恢复状态 | 仅客户端 JSON + `.part` | 服务端按 offset 无状态读取，重启无需恢复任务 |
 | 下载版本判断 | 文件大小 + 修改时间 | 低成本发现常见变化，但不等同于内容哈希 |
@@ -471,19 +473,40 @@ worker 生成 `CompletedTask` 后，在 mutex 下移动到 completion queue，�
 - 已有有界动态业务线程池，但扩缩容只依据 pending/idle，缺少生产级负载指标；
 - 文件 I/O 仍是 worker 中的同步调用；UploadManager 粗粒度锁会限制多上传并行；
 - 协议使用主机字节序和 packed struct，跨架构能力有限；
-- 没有认证、权限、配额和 TLS；
+- 已有最小用户认证和媒体归属，但没有长期 session、角色、配额、私有媒体权限和 TLS；
 - 已支持上传和下载断点续传；上传状态在客户端和服务端持久化，下载状态仅在客户端持久化；
-- 当前 token 不是真正用户权限，且没有 TLS；
+- token 已与 ownerUserId 联合校验，但连接仍是明文 TCP，token 和密码缺少链路加密；
 - 只校验大小、偏移和修改时间等元数据，没有 SHA-256 强内容校验；
 - 没有通用取消和自动重试；客户端“放弃任务”只删除本地记录；
 - 没有任务优先级、工作窃取和客户端同连接多业务并行；
 - FINISH 已提交但客户端尚未收到响应时崩溃，可能留下需要人工放弃的本地状态记录；
-- 目录扫描没有分页。
+- 协议包含 page/pageSize/keyword，但 UI 只使用第一页 100 条和空关键字；没有复杂分页控件。
 
 建议演进顺序：
 
 1. 为协议增加版本、网络字节序和明确整数编码。
 2. 为传输增加通用取消、稳定文件版本标识与 SHA-256 校验。
 3. 完善线程池任务指标、超时治理和 UploadManager 细粒度并发控制。
-4. 增加用户认证和可选数据库索引。
+4. 公网部署前加入 TLS，再评估 session、用户角色和私有媒体授权。
 5. 最后评估自定义 AVIO、HTTP/HLS 或对象存储。
+
+## 17. 阶段 11 认证与媒体发布闭环
+
+```text
+AVClient LOGIN_RQ
+  -> Reactor 组帧并提交 worker
+  -> worker 借 MySQL 连接、查用户、Argon2id verify
+  -> completionQueue + eventfd
+  -> Reactor 以 connectionId 定位连接
+  -> ConnectionContext(authenticated, userId, username)
+
+UPLOAD_FINISH
+  -> 校验任务 ownerUserId
+  -> .part rename 到唯一 stored_name
+  -> Prepared INSERT media
+  -> 成功后删除 .task；失败则尝试 rename 回 .part 并保留任务
+```
+
+数据库池是固定大小，不随动态 worker 数扩张。最大 8 个 worker 竞争默认 4 个数据库连接，获取最多等待约 2.5 秒，超时返回 `DATABASE_UNAVAILABLE`，不会永久占住 worker。每个借出的连接同一时刻只属于一个 worker；包含用户输入的查询和写入均使用当前连接上临时创建的 Prepared Statement。
+
+安全边界需要区分：Argon2id 通过随机盐和高成本密码哈希降低数据库泄露后的离线破解风险；TLS 才能防止网络链路监听密码。当前没有 TLS，只用于本机、局域网和受限测试环境，不应直接暴露公网。

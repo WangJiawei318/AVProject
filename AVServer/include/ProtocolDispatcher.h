@@ -2,13 +2,37 @@
 #define PROTOCOLDISPATCHER_H
 
 #include <stdint.h>
-#include <string>
 #include <ctime>
+#include <string>
 #include <vector>
 
+#include "AuthService.h"
+#include "DatabaseConnectionPool.h"
 #include "DownloadManager.h"
-#include "MediaManager.h"
+#include "MediaRepository.h"
 #include "UploadManager.h"
+
+struct DispatchContext
+{
+    DispatchContext();
+
+    uint64_t connectionId;
+    int clientFd;
+    bool authenticated;
+    uint64_t userId;
+    std::string username;
+};
+
+struct DispatchResult
+{
+    DispatchResult();
+
+    std::vector<std::vector<char> > responses;
+    bool hasAuthUpdate;
+    bool authSuccess;
+    uint64_t authenticatedUserId;
+    std::string authenticatedUsername;
+};
 
 class ProtocolDispatcher
 {
@@ -18,55 +42,49 @@ public:
     bool initialize();
     bool isBusinessPacket(const std::vector<char> &packet,
                           int32_t *protocolType = nullptr) const;
-    void dispatch(uint64_t connectionId,
-                  int clientFd,
+    void dispatch(const DispatchContext &context,
                   const std::vector<char> &packet,
-                  std::vector<std::vector<char> > *responses);
+                  DispatchResult *result);
     void buildErrorResponse(const std::vector<char> &packet,
+                            int32_t errorCode,
                             const std::string &message,
                             std::vector<std::vector<char> > *responses) const;
     void onClientDisconnected(uint64_t connectionId, int clientFd);
     void performMaintenance(std::time_t now);
 
 private:
-    void handlePing(int clientFd,
-                    std::vector<std::vector<char> > *responses);
-    void handleLogin(int clientFd,
-                     std::vector<std::vector<char> > *responses);
-    void handleMediaList(uint64_t connectionId,
-                         int clientFd,
-                         std::vector<std::vector<char> > *responses);
-    void handleUploadInit(uint64_t connectionId,
-                          int clientFd,
+    bool requiresAuthentication(int32_t protocolType) const;
+    void handlePing(const DispatchContext &context, DispatchResult *result);
+    void handleRegister(const std::vector<char> &packet, DispatchResult *result);
+    void handleLogin(const std::vector<char> &packet, DispatchResult *result);
+    void handleMediaList(const DispatchContext &context,
+                         const std::vector<char> &packet,
+                         DispatchResult *result);
+    void handleUploadInit(const DispatchContext &context,
                           const std::vector<char> &packet,
-                          std::vector<std::vector<char> > *responses);
-    void handleUploadResume(uint64_t connectionId,
-                            int clientFd,
+                          DispatchResult *result);
+    void handleUploadResume(const DispatchContext &context,
                             const std::vector<char> &packet,
-                            std::vector<std::vector<char> > *responses);
-    void handleUploadBlock(uint64_t connectionId,
-                           int clientFd,
+                            DispatchResult *result);
+    void handleUploadBlock(const DispatchContext &context,
                            const std::vector<char> &packet,
-                           std::vector<std::vector<char> > *responses);
-    void handleUploadFinish(uint64_t connectionId,
-                            int clientFd,
+                           DispatchResult *result);
+    void handleUploadFinish(const DispatchContext &context,
                             const std::vector<char> &packet,
-                            std::vector<std::vector<char> > *responses);
-    void handleDownloadInit(uint64_t connectionId,
-                            int clientFd,
+                            DispatchResult *result);
+    void handleDownloadInit(const DispatchContext &context,
                             const std::vector<char> &packet,
-                            std::vector<std::vector<char> > *responses);
-    void handleDownloadBlock(uint64_t connectionId,
-                             int clientFd,
+                            DispatchResult *result);
+    void handleDownloadBlock(const DispatchContext &context,
                              const std::vector<char> &packet,
-                             std::vector<std::vector<char> > *responses);
-    void handleDownloadFinish(uint64_t connectionId,
-                              int clientFd,
+                             DispatchResult *result);
+    void handleDownloadFinish(const DispatchContext &context,
                               const std::vector<char> &packet,
-                              std::vector<std::vector<char> > *responses);
+                              DispatchResult *result);
 
-private:
-    MediaManager m_mediaManager;
+    DatabaseConnectionPool m_databasePool;
+    AuthService m_authService;
+    MediaRepository m_mediaRepository;
     UploadManager m_uploadManager;
     DownloadManager m_downloadManager;
 };

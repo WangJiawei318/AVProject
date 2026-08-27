@@ -65,6 +65,7 @@ AVServer/media/
 AVServer/build/
 AVServer/log/
 AVServer/temp/
+AVServer/config/db.conf
 /AVServer/AVServer
 
 # AVClient runtime cache

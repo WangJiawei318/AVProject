@@ -8,6 +8,7 @@
 #include "UploadTaskStore.h"
 
 class AVNetworkClient;
+class QComboBox;
 class QLabel;
 class QFile;
 class QProgressBar;
@@ -28,7 +29,12 @@ signals:
 private slots:
     void slotRefreshClicked();
     void slotConnectedChanged(bool connected);
-    void slotMediaListReceived(const QString &payload);
+    void slotAuthenticationChanged(bool authenticated,
+                                   quint64 userId,
+                                   const QString &username);
+    void slotMediaListResponse(bool success,
+                               const QString &payload,
+                               const QString &message);
     void slotLogMessage(const QString &message);
     void slotUploadClicked();
     void slotUploadInitResponse(bool success,
@@ -47,23 +53,27 @@ private slots:
                                  qint64 receivedOffset,
                                  const QString &message);
     void slotUploadFinishResponse(bool success,
+                                  quint64 mediaId,
                                   const QString &fileName,
                                   const QString &message);
     void slotSelectionChanged();
     void slotDownloadClicked();
     void slotDownloadAndPlayClicked();
     void slotDownloadInitResponse(bool success,
+                                  quint64 mediaId,
                                   const QString &fileName,
                                   qint64 fileSize,
                                   qint64 modifiedTime,
                                   qint64 acceptedOffset,
                                   const QString &message);
     void slotDownloadBlockResponse(bool success,
+                                   quint64 mediaId,
                                    const QString &fileName,
                                    qint64 offset,
                                    const QByteArray &data,
                                    const QString &message);
     void slotDownloadFinishResponse(bool success,
+                                    quint64 mediaId,
                                     const QString &fileName,
                                     const QString &message);
     void slotUploadTaskSelectionChanged();
@@ -97,6 +107,7 @@ private:
     QString localDownloadTaskStatus(const DownloadTaskState &task) const;
     bool prepareSafeDownloadOffset(DownloadTaskState *task, QString *error);
     bool hasConflictingDownloadTask(const QString &fileName) const;
+    quint64 selectedMediaId() const;
     QString selectedMediaFile() const;
     bool isSafeCacheFileName(const QString &fileName) const;
     void updateActionStates();
@@ -104,6 +115,7 @@ private:
 private:
     AVNetworkClient *m_networkClient;
     QLabel *m_statusLabel;
+    QComboBox *m_scopeCombo;
     QPushButton *m_refreshButton;
     QPushButton *m_uploadButton;
     QLabel *m_uploadStatusLabel;
@@ -133,6 +145,7 @@ private:
     QPushButton *m_resumeDownloadButton;
     QPushButton *m_abandonDownloadButton;
     QFile *m_downloadFile;
+    quint64 m_downloadMediaId;
     QString m_downloadFileName;
     QString m_downloadPartPath;
     QString m_downloadFinalPath;

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <ctime>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -12,12 +13,27 @@
 class UploadManager
 {
 public:
+    struct CompletedUpload
+    {
+        uint64_t ownerUserId;
+        std::string originalFileName;
+        std::string storedFileName;
+        std::string storagePath;
+        std::string extension;
+        int64_t fileSize;
+    };
+
+    typedef std::function<bool(const CompletedUpload &,
+                               uint64_t *,
+                               std::string *)> MediaPublisher;
+
     UploadManager(const std::string &tempDir = "temp",
                   const std::string &mediaDir = "media");
     ~UploadManager();
 
     bool initialize();
     bool createUpload(uint64_t ownerConnectionId,
+                      uint64_t ownerUserId,
                       const std::string &fileName,
                       const std::string &extension,
                       int64_t fileSize,
@@ -27,6 +43,7 @@ public:
                       std::string *finalFileName,
                       std::string *message);
     bool resumeUpload(uint64_t ownerConnectionId,
+                      uint64_t ownerUserId,
                       const std::string &transferId,
                       const std::string &resumeToken,
                       const std::string &fileName,
@@ -35,6 +52,7 @@ public:
                       std::string *finalFileName,
                       std::string *message);
     bool writeBlock(uint64_t ownerConnectionId,
+                    uint64_t ownerUserId,
                     const std::string &transferId,
                     int64_t offset,
                     const char *data,
@@ -42,10 +60,13 @@ public:
                     int64_t *receivedOffset,
                     std::string *message);
     bool finishUpload(uint64_t ownerConnectionId,
+                      uint64_t ownerUserId,
                       const std::string &transferId,
                       const std::string &fileName,
                       int64_t fileSize,
+                      const MediaPublisher &publisher,
                       std::string *savedFileName,
+                      uint64_t *mediaId,
                       std::string *message);
     size_t unbindConnection(uint64_t ownerConnectionId);
     size_t cleanupExpiredTasks(std::time_t now);
@@ -67,6 +88,7 @@ private:
         std::time_t createdTime;
         std::time_t updatedTime;
         std::string status;
+        uint64_t ownerUserId;
         uint64_t activeOwnerConnectionId;
     };
 

@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "modules/network/AVNetworkClient.h"
+#include "pages/AuthPage.h"
 #include "pages/PlayerPage.h"
 #include "pages/RecorderPage.h"
 #include "pages/RemoteMediaPage.h"
@@ -17,6 +18,7 @@ MainWindow::MainWindow(QWidget *parent)
     auto *remoteMediaPage = new RemoteMediaPage(m_networkClient, m_tabs);
     m_tabs->addTab(m_playerPage, "Player");
     m_tabs->addTab(new RecorderPage(m_tabs), "Recorder");
+    m_tabs->addTab(new AuthPage(m_networkClient, m_tabs), "Account");
     m_tabs->addTab(remoteMediaPage, "Remote Media");
     m_tabs->addTab(new SettingsPage(m_networkClient, m_tabs), "Settings");
 

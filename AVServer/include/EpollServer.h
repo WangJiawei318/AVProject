@@ -33,6 +33,10 @@ private:
         std::vector<std::vector<char> > responses;
         bool closeConnection;
         bool maintenanceTask;
+        bool hasAuthUpdate;
+        bool authSuccess;
+        uint64_t authenticatedUserId;
+        std::string authenticatedUsername;
         std::string error;
     };
 

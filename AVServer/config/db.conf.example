@@ -1,0 +1,9 @@
+host=127.0.0.1
+port=3306
+database=avproject
+user=avapp
+password=CHANGE_ME
+pool_size=4
+connect_timeout_sec=3
+acquire_timeout_ms=2500
+

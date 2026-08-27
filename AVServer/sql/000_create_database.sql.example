@@ -1,0 +1,13 @@
+-- Run as a MySQL administrator. Replace CHANGE_ME before execution.
+CREATE DATABASE IF NOT EXISTS avproject
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
+CREATE USER IF NOT EXISTS 'avapp'@'127.0.0.1'
+    IDENTIFIED BY 'CHANGE_ME';
+
+GRANT SELECT, INSERT, UPDATE ON avproject.*
+    TO 'avapp'@'127.0.0.1';
+
+FLUSH PRIVILEGES;
+

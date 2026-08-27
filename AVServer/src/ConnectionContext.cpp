@@ -19,7 +19,9 @@ ConnectionContext::ConnectionContext(int socketFd,
       queuedBytes(0),
       lastActivity(std::time(nullptr)),
       closing(false),
-      businessTaskInFlight(false)
+      businessTaskInFlight(false),
+      authenticated(false),
+      userId(0)
 {
     receiveBuffer.reserve(128 * 1024);
 }

@@ -34,6 +34,9 @@ public:
     std::time_t lastActivity;
     bool closing;
     bool businessTaskInFlight;
+    bool authenticated;
+    uint64_t userId;
+    std::string username;
 };
 
 #endif // CONNECTIONCONTEXT_H

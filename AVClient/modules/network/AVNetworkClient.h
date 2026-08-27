@@ -18,8 +18,10 @@ public:
     bool connectToServer(const QString &ip, quint16 port);
     void disconnectFromServer();
     bool sendPing();
+    bool sendRegister(const QString &username, const QString &password);
     bool sendLogin(const QString &username, const QString &password);
-    bool sendMediaListRequest();
+    bool sendMediaListRequest(int scope, int page = 1, int pageSize = 100,
+                              const QString &keyword = QString());
     bool sendUploadInit(const QString &fileName,
                         const QString &extension,
                         qint64 fileSize);
@@ -33,24 +35,33 @@ public:
     bool sendUploadFinish(const QString &transferId,
                           const QString &fileName,
                           qint64 fileSize);
-    bool sendDownloadInit(const QString &fileName,
+    bool sendDownloadInit(quint64 mediaId,
                           qint64 resumeOffset = 0,
                           qint64 expectedFileSize = 0,
                           qint64 expectedModifiedTime = 0);
-    bool sendDownloadBlock(const QString &fileName,
+    bool sendDownloadBlock(quint64 mediaId,
                            qint64 offset,
                            int requestSize);
-    bool sendDownloadFinish(const QString &fileName, qint64 fileSize);
+    bool sendDownloadFinish(quint64 mediaId, qint64 fileSize);
     bool isConnected() const;
     QString serverIp() const;
     quint16 serverPort() const;
+    bool isAuthenticated() const;
+    quint64 currentUserId() const;
+    QString currentUsername() const;
 
 signals:
     void connectedChanged(bool connected);
     void logMessage(const QString &message);
     void pingResponse(const QString &message);
-    void loginResponse(bool success, const QString &message);
-    void mediaListReceived(const QString &payload);
+    void registerResponse(bool success, int errorCode, quint64 userId,
+                          const QString &message);
+    void loginResponse(bool success, int errorCode, quint64 userId,
+                       const QString &username, const QString &message);
+    void authenticationChanged(bool authenticated, quint64 userId,
+                               const QString &username);
+    void mediaListResponse(bool success, const QString &payload,
+                           const QString &message);
     void uploadInitResponse(bool success,
                             const QString &transferId,
                             const QString &resumeToken,
@@ -67,20 +78,24 @@ signals:
                              qint64 receivedOffset,
                              const QString &message);
     void uploadFinishResponse(bool success,
+                              quint64 mediaId,
                               const QString &fileName,
                               const QString &message);
     void downloadInitResponse(bool success,
+                              quint64 mediaId,
                               const QString &fileName,
                               qint64 fileSize,
                               qint64 modifiedTime,
                               qint64 acceptedOffset,
                               const QString &message);
     void downloadBlockResponse(bool success,
+                               quint64 mediaId,
                                const QString &fileName,
                                qint64 offset,
                                const QByteArray &data,
                                const QString &message);
     void downloadFinishResponse(bool success,
+                                quint64 mediaId,
                                 const QString &fileName,
                                 const QString &message);
 
@@ -95,6 +110,9 @@ private:
     TcpClient *m_tcpClient;
     QString m_serverIp;
     quint16 m_serverPort;
+    bool m_authenticated;
+    quint64 m_currentUserId;
+    QString m_currentUsername;
 };
 
 #endif // AVNETWORKCLIENT_H

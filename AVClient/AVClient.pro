@@ -14,6 +14,7 @@ DESTDIR = $$PWD/bin
 SOURCES += \
     main.cpp \
     MainWindow.cpp \
+    pages/AuthPage.cpp \
     pages/PlayerPage.cpp \
     pages/RecorderPage.cpp \
     pages/RemoteMediaPage.cpp \
@@ -34,6 +35,7 @@ SOURCES += \
 
 HEADERS += \
     MainWindow.h \
+    pages/AuthPage.h \
     pages/PlayerPage.h \
     pages/RecorderPage.h \
     pages/RemoteMediaPage.h \

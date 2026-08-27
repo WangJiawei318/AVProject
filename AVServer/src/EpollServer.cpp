@@ -41,7 +41,10 @@ EpollServer::CompletedTask::CompletedTask()
       clientFd(-1),
       protocolType(0),
       closeConnection(false),
-      maintenanceTask(false)
+      maintenanceTask(false),
+      hasAuthUpdate(false),
+      authSuccess(false),
+      authenticatedUserId(0)
 {
 }
 
@@ -436,6 +439,16 @@ bool EpollServer::handleCompletionEvent()
             continue;
         }
 
+        if (completed.hasAuthUpdate && completed.authSuccess) {
+            connection.authenticated = true;
+            connection.userId = completed.authenticatedUserId;
+            connection.username = completed.authenticatedUsername;
+            std::printf("connection authenticated connectionId=%llu userId=%llu username=%s\n",
+                        static_cast<unsigned long long>(connection.connectionId),
+                        static_cast<unsigned long long>(connection.userId),
+                        connection.username.c_str());
+        }
+
         std::printf("completion delivered connectionId=%llu fd=%d protocol=%d responses=%zu\n",
                     static_cast<unsigned long long>(completed.connectionId),
                     clientFd,
@@ -482,13 +495,16 @@ bool EpollServer::parseFrames(ConnectionContext &connection)
             continue;
         }
 
-        std::vector<std::vector<char> > responses;
-        m_dispatcher.dispatch(connection.connectionId,
-                              connection.fd,
-                              packet,
-                              &responses);
-        for (size_t index = 0; index < responses.size(); ++index) {
-            if (!queueResponse(connection, responses[index]))
+        DispatchContext context;
+        context.connectionId = connection.connectionId;
+        context.clientFd = connection.fd;
+        context.authenticated = connection.authenticated;
+        context.userId = connection.userId;
+        context.username = connection.username;
+        DispatchResult dispatchResult;
+        m_dispatcher.dispatch(context, packet, &dispatchResult);
+        for (size_t index = 0; index < dispatchResult.responses.size(); ++index) {
+            if (!queueResponse(connection, dispatchResult.responses[index]))
                 return false;
         }
     }
@@ -504,9 +520,13 @@ bool EpollServer::submitBusinessTask(ConnectionContext &connection,
 
     const uint64_t connectionId = connection.connectionId;
     const int clientFd = connection.fd;
+    const bool authenticated = connection.authenticated;
+    const uint64_t authenticatedUserId = connection.userId;
+    const std::string authenticatedUsername = connection.username;
     connection.businessTaskInFlight = true;
     const bool submitted = m_threadPool.submit(
-                [this, connectionId, clientFd, protocolType, packet]() {
+                [this, connectionId, clientFd, protocolType, packet,
+                 authenticated, authenticatedUserId, authenticatedUsername]() {
         CompletedTask completed;
         completed.connectionId = connectionId;
         completed.clientFd = clientFd;
@@ -516,10 +536,19 @@ bool EpollServer::submitBusinessTask(ConnectionContext &connection,
                     clientFd,
                     protocolType);
         try {
-            m_dispatcher.dispatch(connectionId,
-                                  clientFd,
-                                  packet,
-                                  &completed.responses);
+            DispatchContext context;
+            context.connectionId = connectionId;
+            context.clientFd = clientFd;
+            context.authenticated = authenticated;
+            context.userId = authenticatedUserId;
+            context.username = authenticatedUsername;
+            DispatchResult dispatchResult;
+            m_dispatcher.dispatch(context, packet, &dispatchResult);
+            completed.responses.swap(dispatchResult.responses);
+            completed.hasAuthUpdate = dispatchResult.hasAuthUpdate;
+            completed.authSuccess = dispatchResult.authSuccess;
+            completed.authenticatedUserId = dispatchResult.authenticatedUserId;
+            completed.authenticatedUsername = dispatchResult.authenticatedUsername;
         } catch (const std::exception &error) {
             completed.closeConnection = true;
             completed.error = std::string("business task exception: ") + error.what();
@@ -551,7 +580,8 @@ bool EpollServer::submitBusinessTask(ConnectionContext &connection,
                 clientFd,
                 protocolType);
     std::vector<std::vector<char> > responses;
-    m_dispatcher.buildErrorResponse(packet, "server busy", &responses);
+    m_dispatcher.buildErrorResponse(packet, AV_ERROR_SERVER_BUSY,
+                                    "server busy", &responses);
     for (size_t index = 0; index < responses.size(); ++index) {
         if (!queueResponse(connection, responses[index]))
             return false;

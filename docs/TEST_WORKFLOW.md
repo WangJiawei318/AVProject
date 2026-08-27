@@ -1,194 +1,88 @@
-# AVProject 完整测试流程
+# AVProject 测试流程
 
 ## 1. 测试前准备
 
-- Ubuntu IP：`192.168.44.130`
-- 服务端端口：`8000`
-- `AVServer/media/` 至少准备一个受支持媒体
-- Windows 摄像头、麦克风按录制需要授权
+- Ubuntu 已安装并启动 MySQL，`users`/`media` 表已初始化。
+- `AVServer/config/db.conf` 使用专用 `avapp` 账号，MySQL 只监听本机或受控网络。
+- Windows 客户端与 Ubuntu 服务端可互相访问 `192.168.44.130:8000`。
+- 准备一个较大的受支持媒体文件，便于中途断开传输。
 
-## 2. 启动服务端
+## 2. 启动
+
+Ubuntu：
 
 ```bash
 cd ~/AVProject/AVServer
-make clean
-make
+make clean && make
 ./AVServer 8000
 ```
 
-确认打印：
+确认日志包含数据库池、4 个核心 worker、epoll LT、eventfd 和监听端口。Windows 启动 `AVClient/bin/AVClient.exe`，在 Settings 连接服务器并先执行 Ping。
 
-```text
-AVServer started
-media directory: media
-upload temp directory: temp
-epoll LT reactor initialized
-eventfd initialized
-core worker count=4
-max worker count=8
-task queue capacity=256
-listening on port 8000
+## 3. 认证测试
+
+1. 在 Account 页注册 userA，确认成功后不会自动登录。
+2. 再次注册 userA，确认返回用户名已存在。
+3. 使用错误密码登录，确认失败。
+4. 使用正确密码登录，确认显示 userId 和用户名。
+5. 断开并重连，确认登录状态消失且必须重新登录。
+6. 注册并登录 userB，重复后续多用户测试。
+
+禁用用户可在 Ubuntu 执行：
+
+```sql
+UPDATE users SET status=0 WHERE username='userA';
+UPDATE users SET status=1 WHERE username='userA';
 ```
 
-还应看到上传任务目录和 4 个核心 worker 的创建日志。若有未完成任务，日志会显示恢复任务及安全偏移。后续连接和协议日志应带有 `fd=...`、`connectionId=...` 和协议类型。
+禁用后登录应返回 USER_DISABLED。检查 `SELECT username,password_hash FROM users;`，密码列应是 Argon2id 字符串而不是原始密码。
 
-## 3. 启动并连接客户端
+## 4. 访问控制
 
-1. 启动 `AVClient/bin/AVClient.exe`。
-2. 打开 Settings。
-3. 输入 `192.168.44.130` 和 `8000`。
-4. 点击 Connect。
-5. 确认状态为 Connected。
+新建未登录连接，确认 Ping 可用，但 MEDIA_LIST、UPLOAD 和 DOWNLOAD 均返回 AUTH_REQUIRED。业务协议包不携带可信 userId，服务端日志中的 userId 应来自 ConnectionContext。
 
-## 4. 功能测试
+## 5. 媒体归属闭环
 
-### 4.1 Ping
+1. userA 登录，切换 Public media，刷新成功。
+2. userA 上传 A.mp4，完成后检查 `media/` 中是唯一 stored name，MySQL 出现 owner 为 userA 的记录。
+3. 切换 My media，只看到 userA 自己的媒体。
+4. userB 上传 B.mp4；userB 的 My media 只显示 B，Public media 显示 A 和 B。
+5. 选择表格中的 mediaId 下载，确认 `.part` 完成后改名并可播放。
+6. 选择 Download and play，确认完成后切换 Player 页播放本地 cache 文件。
 
-点击 Send Ping，确认客户端收到 Pong，服务端打印 `PING_RQ/PING_RS`。
+历史 `media/` 文件若没有 MySQL 记录，不应出现在列表中，也不应自动归属第一个用户。
 
-### 4.2 本地播放
+## 6. 续传回归
 
-Player 页打开本地媒体，验证播放、暂停、恢复、停止和 seek。
+上传到 20% 至 50% 时断开。确认 `.task` 包含 `owner_user_id`，同一用户重新登录后可恢复；userB 即使得到 transferId 和 token 也必须收到 PERMISSION_DENIED。重启 AVServer 后 userA 仍可恢复，旧的 owner=0 任务应被拒绝。
 
-### 4.3 本地录制
+下载到 20% 至 50% 时断开。确认客户端 `.download.json` 保存 mediaId，重启 AVClient、重新连接并登录后从非零 safe offset 恢复。AVServer 重启不需要下载任务元数据。远程文件 size/mtime 改变时应拒绝拼接；完成后仍可自动播放。
 
-Recorder 页开始录制数秒后停止，确认 `AVClient/bin/recordings/` 生成 FLV，并能在 Player 页播放。
+## 7. 数据库异常与并发
 
-### 4.4 远程列表
+1. 正常登录后停止 MySQL，再从另一连接发起 LOGIN/MEDIA_LIST。
+2. 数据库业务应在有限等待后返回 DATABASE_UNAVAILABLE，不应永久卡住 worker。
+3. 同时从其他连接持续发送 Ping，确认 Reactor 仍响应。
+4. 恢复 MySQL 后重试；连接池会在借用时 ping 并尝试重连。若当前客户端库环境无法恢复，记录后重启 AVServer。
+5. 使用多个 AVClient 同时执行 Ping、PUBLIC/MINE、上传和下载，观察 worker 扩缩容且不超过 8。
 
-Remote Media 页点击 Refresh media list，确认列表与 `AVServer/media/` 一致。
-
-### 4.5 上传
-
-点击 Select and upload file，选择支持格式，确认进度到 100%、服务端 `media/` 出现文件、列表自动刷新。
-
-### 4.6 下载
-
-选择远程文件，点击 Download file，确认：
-
-- 进度到 100%；
-- `AVClient/cache/` 出现正式文件；
-- 文件大小与服务端一致；
-- Player 页可手动打开。
-
-### 4.7 下载并播放
-
-选择远程文件，点击 Download and play，确认下载完成后自动切换 Player 页并开始播放。
-
-## 5. 完整闭环
-
-```text
-本地录制或准备媒体
-  -> 上传到 AVServer/media/
-  -> 刷新远程列表
-  -> 选择刚上传的文件
-  -> 下载到 AVClient/cache/
-  -> 自动切换并播放
-```
-
-该流程全部通过即可完成当前版本核心演示。
-
-## 6. 多客户端并发测试
-
-先运行自动化 Ping 和列表测试：
+## 8. 自动化烟测
 
 ```bash
 cd ~/AVProject
-python3 tools/concurrent_client_test.py 192.168.44.130 8000 5 --pings 10 --media-list
+python3 tools/auth_media_test.py --host 127.0.0.1 --port 8000
+python3 tools/concurrent_client_test.py 127.0.0.1 8000 5 --pings 10
 ```
 
-确认 5 个连接均成功且 `failed=0`。再启动至少 3 个 AVClient：A 上传文件，B 持续 Ping，C 刷新列表或下载；中途关闭 A，确认 B、C 仍可使用，并检查 A 的未完成 `.part` 与任务元数据被保留且任务已解除活动连接绑定。
+第一条覆盖未登录列表、重复注册、错误密码、SQL 注入式用户名、正确登录、userA/userB 以及 PUBLIC/MINE 基础请求。完整上传、下载、断点恢复和播放仍使用 AVClient 人工验证。
 
-## 7. 上传断点续传测试
+## 9. 安全检查
 
-自动化测试：
+- 客户端和服务端日志不得出现原始密码、password hash、完整 resume token 或数据库密码。
+- 用户名 `' OR 1=1 --` 不能绕过登录；所有用户输入 SQL 都使用 Prepared Statement。
+- MySQL 不使用 root 应用账号，不为 AVProject 对公网开放 3306。
+- 当前 TCP 没有 TLS，只能用于本机、局域网和受限测试环境。
 
-```bash
-cd ~/AVProject
-python3 tools/resumable_upload_test.py 192.168.44.130 8000 \
-  --size-mb 8 --blocks-before-disconnect 20
-```
+## 10. 本地音视频回归
 
-人工重点验证五种场景：
-
-1. **网络断开**：上传到 20% 至 50% 后断开，重连并点击“恢复上传”，确认进度不是从 0 开始。
-2. **客户端重启**：中途关闭 AVClient，重启后确认未完成任务仍显示，连接原服务器后恢复完成。
-3. **服务端重启**：中途停止 AVServer，重新启动并确认加载任务日志，客户端重连后从服务端偏移继续。
-4. **非法恢复**：使用错误 token 请求恢复，服务端拒绝且原 `.part` 大小不变。
-5. **多客户端竞争**：A 恢复后，B 使用同一任务凭据请求恢复；B 收到 `task already active`，A 可继续。
-
-完成后确认 `temp/<transfer_id>.part` 和 `temp/tasks/<transfer_id>.task` 已删除，正式文件进入 `media/`，媒体列表自动刷新。修改本地源文件大小或最后修改时间后，AVClient 应拒绝直接恢复。
-
-## 8. 下载断点续传测试
-
-自动化测试：
-
-```bash
-cd ~/AVProject
-python3 tools/resumable_download_test.py 192.168.44.130 8000 test.mp4 \
-  --blocks-before-disconnect 4 --output-dir ./download-test
-```
-
-人工重点验证四种场景：
-
-1. **网络断开**：下载到 20% 至 50% 后断开，确认 `.part` 和状态保留；重连后点击“恢复下载”，确认从非零进度继续。
-2. **客户端重启**：中途关闭并重启 AVClient，确认未完成下载仍显示，连接原服务器后恢复。
-3. **服务端重启**：中途重启 AVServer，客户端重连并恢复；服务端不需要下载任务元数据。
-4. **远程文件变化**：部分下载后替换服务端同名文件，恢复应返回 `remote file changed`，旧 `.part` 不得追加新数据。
-
-完成后确认 `.part` 改为正式 cache 文件、下载状态已删除；“下载并播放”任务恢复完成后应自动切换 Player 页。放弃任务应删除本地状态和 `.part`。
-
-## 9. 动态业务线程池测试
-
-自动化测试：
-
-```bash
-cd ~/AVProject
-python3 tools/thread_pool_concurrency_test.py \
-  192.168.44.130 8000 \
-  --clients 10 --requests 20
-```
-
-确认脚本输出 `failed=0`。如服务端已有 `test.mp4`，可增加 `--download-file test.mp4 --download-blocks 4` 验证并发分片读取。人工回归六类场景：
-
-1. **基础多客户端**：A 上传，B 持续 Ping，C 刷新列表并下载，三者均正常。
-2. **并行文件操作**：A 上传、B 下载、C 扫描列表，日志显示不同 `connectionId` 被不同 worker 执行。
-3. **任务期间断开**：在 A 的业务任务执行时关闭 A，确认 completion 被丢弃，B、C 不受影响。
-4. **续传回归**：分别中断并恢复上传和下载，确认权威 offset、`.part` 与状态文件逻辑不回退。
-5. **关闭服务端**：存在连接和任务时发送 SIGINT/SIGTERM，确认停止接收任务、排空已入队任务、join worker 后退出。
-6. **动态扩缩容**：启动为 4 个核心线程；增加并发业务使线程逐步扩到最多 8 个；任务结束并空闲约 60 秒后恢复到 4 个；再次 Ping、上传和下载仍正常。
-
-队列上限为 256。若通过足够高的并发制造过载，应看到 `task rejected: queue full`，客户端收到 `server busy`，而连接的 in-flight 状态不能永久卡住。
-
-## 10. 常见异常测试
-
-| 场景 | 预期结果 |
-| --- | --- |
-| 服务端未启动 | Connect 失败，客户端不崩溃 |
-| 未连接时刷新 | 提示先连接，不能发送列表请求 |
-| 未连接时上传/下载 | 弹出连接提示 |
-| 上传不支持格式 | 客户端拒绝，服务端也有白名单 |
-| 下载未选择文件 | 提示先选择远程媒体 |
-| `media/` 为空 | 列表为空并记录日志 |
-| 上传中断开连接 | 客户端显示等待恢复，服务端保留 `.part` 与任务元数据 |
-| 下载中断开连接 | 客户端保留 `.part` 和状态，任务显示等待恢复 |
-| 恢复时服务器地址不匹配 | 拒绝发送，提示连接任务所属服务器 |
-| 恢复时远程文件版本变化 | 返回 `remote file changed`，不继续写入 |
-| 上传同名文件 | 服务端自动生成 `_1`、`_2` 名称 |
-| cache 已有同名文件 | 完整下载后用新文件替换 |
-| 一个客户端发送非法包长 | 只关闭该连接，其他客户端继续工作 |
-| 一个客户端长期不读取响应 | 该连接发送队列达到上限后被关闭 |
-| 业务线程池队列已满 | 当前请求收到 `server busy`，其他连接继续工作 |
-| worker 完成前连接已关闭 | Reactor 按 `connectionId` 丢弃陈旧结果，不向复用 fd 发送 |
-
-## 11. 测试记录建议
-
-演示或提交前记录：
-
-- 客户端和服务端 commit；
-- Qt/MinGW 与 Ubuntu/g++ 版本；
-- 测试文件名和大小；
-- Ping、列表、上传、下载结果；
-- 并发工具成功数、失败数和耗时；
-- 是否完成下载后自动播放；
-- 已知问题。
+最后重新测试本地文件播放、暂停、seek、停止；桌面/摄像头/麦克风录制；录制文件播放。阶段 11 不应改变播放器、录制器及其第三方库配置。

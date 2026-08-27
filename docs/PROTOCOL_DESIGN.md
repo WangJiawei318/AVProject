@@ -92,20 +92,20 @@ sizeof(PackType) <= packLen <= 256 KB（阶段 7 服务端）
 
 ## 6. 通用数据定义
 
-协议头位于：
+协议结构的单一真实定义位于：
 
 ```text
-AVClient/modules/network/av_protocol.h
 AVServer/include/av_protocol.h
 ```
 
-两份文件必须保持一致。
+客户端 `AVClient/modules/network/av_protocol.h` 只包含上述服务端头文件，避免两份 packed struct 漂移。
 
 主要常量：
 
 | 常量 | 值 | 用途 |
 | --- | ---: | --- |
-| `AV_NAME_SIZE` | 32 | 测试登录用户名和密码 |
+| `AV_NAME_SIZE` | 33 | 32 字节用户名加结尾 `\0` |
+| `AV_PASSWORD_SIZE` | 65 | 64 字节密码加结尾 `\0` |
 | `AV_TEXT_SIZE` | 128 | 响应消息 |
 | `AV_FILE_NAME_SIZE` | 256 | UTF-8 文件名缓冲 |
 | `AV_EXTENSION_SIZE` | 16 | 扩展名 |
@@ -129,8 +129,8 @@ AVServer/include/av_protocol.h
 | ---: | --- | --- | --- |
 | 20001 | `PING_RQ` | Client -> Server | 测试连接 |
 | 20002 | `PING_RS` | Server -> Client | 返回 Pong |
-| 20003 | `LOGIN_RQ` | Client -> Server | 早期协议测试预留 |
-| 20004 | `LOGIN_RS` | Server -> Client | 返回测试登录结果 |
+| 20003 | `LOGIN_RQ` | Client -> Server | 用户登录 |
+| 20004 | `LOGIN_RS` | Server -> Client | 返回登录和用户身份结果 |
 | 20005 | `MEDIA_LIST_RQ` | Client -> Server | 请求媒体列表 |
 | 20006 | `MEDIA_LIST_RS` | Server -> Client | 返回文本列表 |
 | 20007 | `UPLOAD_INIT_RQ` | Client -> Server | 初始化上传 |
@@ -147,8 +147,10 @@ AVServer/include/av_protocol.h
 | 20018 | `DOWNLOAD_FINISH_RS` | Server -> Client | 返回完成确认 |
 | 20019 | `UPLOAD_RESUME_RQ` | Client -> Server | 携带任务凭据请求恢复上传 |
 | 20020 | `UPLOAD_RESUME_RS` | Server -> Client | 返回服务端确认的恢复偏移 |
+| 20021 | `REGISTER_RQ` | Client -> Server | 用户注册 |
+| 20022 | `REGISTER_RS` | Server -> Client | 返回注册结果 |
 
-`LOGIN_RQ/RS` 目前不是正式用户系统，只是阶段 2 留下的协议测试结构。项目没有数据库用户认证。
+REGISTER、LOGIN 允许未登录访问，PING 也保持公开；MEDIA_LIST、所有 UPLOAD 和 DOWNLOAD 协议都要求当前 `ConnectionContext.authenticated=true`。业务包中不携带 userId，服务端从当前连接读取可信身份。
 
 ## 8. Ping 协议
 
@@ -170,15 +172,25 @@ message: char[128]
 
 服务端返回 `pong from AVServer`。Ping 只能说明当前 TCP 和协议收发可用，不代表文件目录一定有权限。
 
+### 8.3 注册与登录
+
+`REGISTER_RQ` 和 `LOGIN_RQ` 都包含 `username[33] + password[65]`。响应包含 `result`、结构化 `errorCode`、数据库 `userId` 和可读消息；LOGIN 响应还回传规范用户名。密码只在当前明文 TCP 请求中出现，不写日志、不保存明文，服务端 worker 使用 libsodium Argon2id 验证。登录成功后，worker 只生成认证变更结果，Reactor 通过 completionQueue/eventfd 收到结果并更新对应 connectionId 的连接身份。
+
+错误码包括：SUCCESS、USERNAME_EXISTS、INVALID_USERNAME_OR_PASSWORD、USER_DISABLED、AUTH_REQUIRED、DATABASE_UNAVAILABLE、SERVER_BUSY、INVALID_REQUEST、PERMISSION_DENIED 和 INTERNAL。数据库内部错误不会原样返回客户端。
+
 ## 9. 媒体列表协议
 
 ### 9.1 MEDIA_LIST_RQ
 
 ```text
 type: int32
+scope: int32             # PUBLIC=1, MINE=2
+page: int32              # 从 1 开始
+pageSize: int32          # 1..100
+keyword: char[128]
 ```
 
-没有额外参数，服务端扫描固定 `media/`。
+服务端从 MySQL `media` 表查询。PUBLIC 返回所有 published 媒体；MINE 使用可信连接 userId 限定 owner。当前 UI 固定 page=1、pageSize=100、keyword 为空。
 
 ### 9.2 MEDIA_LIST_RS
 
@@ -186,21 +198,22 @@ type: int32
 
 ```text
 type: int32
+result: int32
+errorCode: int32
 payloadSize: int32
+message: char[128]
 ```
 
 后面紧跟 `payloadSize` 字节 UTF-8 文本：
 
 ```text
-filename|filesize|mtime|extension\n
-filename|filesize|mtime|extension\n
+mediaId|ownerUserId|ownerName|originalName|fileSize|extension|createdAt|status\n
 ```
 
 示例：
 
 ```text
-demo.mp4|10485760|2026-06-27 10:20:30|mp4
-record.flv|8388608|2026-06-27 10:25:10|flv
+101|7|userA|demo.mp4|10485760|mp4|2026-08-27 10:20:30|published
 ```
 
 ### 9.3 为什么列表使用文本 payload
@@ -219,7 +232,7 @@ record.flv|8388608|2026-06-27 10:25:10|flv
 - 大列表体积比二进制大；
 - 没有分页。
 
-服务端会把文件名中的 `|`、换行替换为 `_`，避免破坏行格式。
+上传入口禁止文件名包含 `|`、换行和控制字符；列表输出还会对文本字段做基础替换，中文 UTF-8 文件名保持原字节。该文本格式仍不是通用序列化方案。
 
 ## 10. 上传协议
 
@@ -241,6 +254,8 @@ WaitingResume
   -> UPLOAD_RESUME_RS(success, resume_offset)
   -> Transferring
 ```
+
+所有上传请求都要求已登录。新任务把可信 `ConnectionContext.userId` 写成 `.task` 的 `owner_user_id`；RESUME/BLOCK/FINISH 都再次校验 owner，客户端不能在包中自报 userId。
 
 客户端任意时刻只有一个未确认分片。普通上传从 INIT 返回的 offset 0 开始；恢复上传从 RESUME 返回的服务端确认偏移开始。
 
@@ -266,6 +281,7 @@ extension: char[16]
 ```text
 type: int32
 result: int32
+errorCode: int32
 transferId: char[96]
 resumeToken: char[128]
 resumeOffset: int64
@@ -314,6 +330,7 @@ dataSize 字节二进制文件数据
 ```text
 type: int32
 result: int32
+errorCode: int32
 transferId: char[96]
 receivedOffset: int64
 message: char[128]
@@ -337,18 +354,20 @@ fileSize: int64
 - `.part` 的磁盘实际大小；
 - FINISH 再次声明的大小。
 
-一致后将临时文件移动到 `media/`。同名文件自动增加数字后缀。
+一致后把临时文件移动为唯一 `<transferId>.<extension>`，再用 Prepared Statement 插入 `media`。插入失败时不返回成功，并尝试把正式文件恢复为 `.part`，保留任务供稍后重新 FINISH。
 
 ### 10.7 UPLOAD_FINISH_RS
 
 ```text
 type: int32
 result: int32
+errorCode: int32
+mediaId: uint64
 fileName: char[256]
 message: char[128]
 ```
 
-`fileName` 是服务端最终保存名，可能与原名不同。
+`fileName` 是用户原始文件名，`mediaId` 是上传完成后插入 MySQL 得到的稳定业务 ID。磁盘实际名称使用 `<transferId>.<extension>`，不会把内部 `stored_name/storage_path` 暴露给客户端。
 
 ### 10.8 UPLOAD_RESUME_RQ
 
@@ -360,13 +379,14 @@ fileName: char[256]
 expectedSize: int64
 ```
 
-服务端同时校验任务 ID、token、原文件名和预期大小。只凭文件名或 transfer ID 不能恢复任务。若任务已经绑定其他活动连接，返回 `task already active`。
+服务端同时校验任务 ID、token、当前登录 ownerUserId、原文件名和预期大小。只凭文件名、transfer ID，甚至拿到其他用户的 token 都不能越权恢复。若任务已经绑定其他活动连接，返回 `task already active`；旧 `.task` 没有 owner 字段时按 legacy owner 0 加载并拒绝恢复。
 
 ### 10.9 UPLOAD_RESUME_RS
 
 ```text
 type: int32
 result: int32
+errorCode: int32
 transferId: char[96]
 resumeOffset: int64
 finalFileName: char[256]
@@ -377,7 +397,7 @@ message: char[128]
 
 ### 10.10 服务端任务元数据
 
-服务端为每个 uploading 任务保存一个小型键值文件，字段包括 transfer ID、token、原名、最终名、预期/已接收大小、临时路径、创建/更新时间和状态。更新流程是“写 `.tmp`、`fsync`、`rename` 覆盖”，降低崩溃留下半写元数据的概率。
+服务端为每个 uploading 任务保存一个小型键值文件，字段包括 transfer ID、token、owner user ID、原名、唯一存储名、预期/已接收大小、临时路径、创建/更新时间和状态。更新流程是“写 `.tmp`、`fsync`、`rename` 覆盖”，降低崩溃留下半写元数据的概率。
 
 启动恢复时，如果元数据 `received_size` 与 `.part` 实际大小不一致，取两者较小值并在必要时截断超前的 `.part`。这会牺牲最后少量未同步状态，但不会跳过服务端无法可靠证明已经接收的字节。
 
@@ -414,19 +434,21 @@ Completed 或 Failed
 
 ```text
 type: int32
-fileName: char[256]
+mediaId: uint64
 resumeOffset: int64
 expectedFileSize: int64
 expectedModifiedTime: int64
 ```
 
-新下载把后三个字段置为 0。恢复下载携带客户端计算出的安全偏移，以及第一次 INIT 保存的文件大小和修改时间。服务端不接受路径，只在固定 `media/` 中查找经过验证的普通媒体文件。
+新下载把后三个字段置为 0。恢复下载携带客户端持久化的 mediaId、本地安全偏移，以及第一次 INIT 保存的文件大小和修改时间。服务端不接受文件名或路径作为定位依据，而是查询 published `media` 记录并取得可信内部路径。
 
 ### 12.3 DOWNLOAD_INIT_RS
 
 ```text
 type: int32
 result: int32
+errorCode: int32
+mediaId: uint64
 fileName: char[256]
 fileSize: int64
 modifiedTime: int64
@@ -451,7 +473,7 @@ AVClient/cache/<fileName>.part
 
 ```text
 type: int32
-fileName: char[256]
+mediaId: uint64
 offset: int64
 requestSize: int32
 ```
@@ -465,6 +487,8 @@ requestSize: int32
 ```text
 type: int32
 result: int32
+errorCode: int32
+mediaId: uint64
 fileName: char[256]
 offset: int64
 dataSize: int32
@@ -485,7 +509,7 @@ message: char[128]
 
 ```text
 type: int32
-fileName: char[256]
+mediaId: uint64
 fileSize: int64
 ```
 
@@ -496,6 +520,8 @@ fileSize: int64
 ```text
 type: int32
 result: int32
+errorCode: int32
+mediaId: uint64
 fileName: char[256]
 message: char[128]
 ```
@@ -559,7 +585,7 @@ message: char[128]
 当前没有：
 
 - TLS 加密；
-- 用户认证与授权；
+- 长期 session、角色、私有媒体授权和 TLS；
 - 防重放；
 - 限速和配额；
 - 内容哈希；
@@ -574,7 +600,7 @@ message: char[128]
 4. 没有协议版本号和能力协商。
 5. 没有 request_id，多个并发请求难以关联。
 6. 上传有 transfer ID 和恢复 token；下载刻意保持服务端无状态，没有持久任务 ID。
-7. 错误码只有 result 和字符串，无法程序化分类。
+7. 已有结构化错误码，但仍缺少协议版本、request ID 和统一通用响应头。
 8. 列表是分隔文本，没有转义协议、分页和总数。
 9. 串行 ACK 简单但高 RTT 下吞吐较低。
 10. 没有哈希，等长内容损坏无法发现。
@@ -644,7 +670,7 @@ block_index 或 offset
 
 ## 21. 阶段 10：协议调度与线程池过载处理
 
-阶段 10 **没有改变线上帧格式和业务结构体**。客户端仍然发送“4 字节包长度 + 协议包体”，阶段 1 至 9 的客户端不需要因为服务端加入线程池而修改。`connectionId`、`businessTaskInFlight`、`completionQueue` 和 `eventfd` 都是 AVServer 进程内部的调度机制，不在线上传输，也不是用户身份或恢复凭证。
+阶段 10 本身没有改变线上帧格式；阶段 11 在保留“4 字节包长度 + 协议包体”的前提下扩展了认证、错误码、媒体列表和 mediaId 下载字段。`connectionId`、`businessTaskInFlight`、`completionQueue` 和 `eventfd` 都是 AVServer 进程内部调度机制，不在线上传输，也不是用户身份或恢复凭证。
 
 服务端收到完整帧后按协议类型分流：
 
@@ -652,7 +678,7 @@ block_index 或 offset
 PING_RQ
   -> Reactor 直接生成 PING_RS
 
-MEDIA_LIST_RQ / UPLOAD_* / DOWNLOAD_*
+REGISTER_RQ / LOGIN_RQ / MEDIA_LIST_RQ / UPLOAD_* / DOWNLOAD_*
   -> 有界业务线程池
   -> 生成一个或多个协议响应
   -> completionQueue
@@ -662,13 +688,19 @@ MEDIA_LIST_RQ / UPLOAD_* / DOWNLOAD_*
 
 每个连接最多只有一个业务任务在线程池中执行。后续完整帧可以继续被 `recv()` 收入该连接的 `receiveBuffer`，但要等当前任务完成后再分发。因此同一连接上的上传分片、下载请求和列表请求仍按接收顺序执行；不同连接可以由不同 worker 并行处理。
 
-线程池队列达到上限时，`submit()` 返回失败。服务端清除该连接的 in-flight 状态，并构造与原请求类型匹配的失败响应，消息为 `server busy`，而不是让连接永久停住。当前媒体列表响应没有统一的 `result/message` 字段，所以列表过载错误仍以文本 payload 返回；这是现有协议错误模型不统一的一个限制，后续可通过通用错误包或统一响应头改进。
+线程池队列达到上限时，`submit()` 返回失败。服务端清除该连接的 in-flight 状态，并构造与原请求类型匹配、错误码为 `SERVER_BUSY` 的失败响应，而不是让连接永久停住。媒体列表也有 `result/errorCode/message` 固定头。
 
 工作线程只接收协议包副本、`connectionId` 和仅供日志使用的 fd，不持有 `ConnectionContext*`，也不直接调用 `send()` 或 `epoll_ctl()`。完成结果回投后，Reactor 必须再次按 `connectionId` 验证连接是否存在；若客户端已经断开，即使旧 fd 被操作系统复用，结果也会被丢弃，不会发送给新连接。
 
 阶段 10 后协议层仍有以下边界：
 
 - packed struct 和整数仍依赖当前小端环境，尚无协议版本与网络字节序转换；
-- 没有统一错误码、request ID、用户鉴权或 TLS；
+- 已有业务错误码和连接级用户鉴权，但没有 request ID、长期 session 或 TLS；
 - `server busy` 是即时拒绝，不包含客户端退避时间，也不会自动重试；
 - 有界线程池改善了 Reactor 被同步文件 I/O 阻塞的问题，但不等于已经达到生产级高并发能力。
+
+## 22. 阶段 11 安全边界
+
+密码哈希和传输加密解决不同问题。Argon2id 的完整字符串包含算法、参数、随机盐和哈希，数据库不保存明文密码；但 REGISTER/LOGIN 当前仍通过明文 TCP 传输原始密码。客户端先做 MD5 不能替代 TLS，因为该固定摘要本身会变成可重放凭据。当前认证只适用于本机、局域网和受限测试环境，公网部署前必须加入 TLS 和服务器身份校验。
+
+所有包含用户输入的数据库操作都使用 MySQL Prepared Statement；客户端传来的 userId、stored_name 或 storage_path 不参与授权。登录后的可信 userId 只存在于服务端 `ConnectionContext`，断开即销毁，重连必须重新登录。

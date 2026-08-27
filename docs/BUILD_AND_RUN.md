@@ -198,7 +198,7 @@ AVClient/
 
 ```bash
 sudo apt update
-sudo apt install build-essential
+sudo apt install build-essential default-libmysqlclient-dev libsodium-dev mysql-server
 ```
 
 确认：
@@ -206,9 +206,31 @@ sudo apt install build-essential
 ```bash
 g++ --version
 make --version
+mysql_config --version
+pkg-config --modversion libsodium
 ```
 
-当前 `AVServer` 只依赖 C++ 标准库和 Linux/POSIX socket、文件系统 API，不需要 Qt、FFmpeg、OpenCV 或 MySQL。
+`AVServer` 不依赖 Qt、FFmpeg、SDL 或 OpenCV，但阶段 11 需要 MySQL C API 开发包和 libsodium。Ubuntu/Debian 使用 `default-libmysqlclient-dev` 可获得 `mysql_config` 与兼容客户端头库；`libsodium-dev` 提供 Argon2id 密码哈希接口。
+
+### 7.1 初始化数据库
+
+先编辑 `sql/000_create_database.sql.example`，把两处 `CHANGE_ME` 改为同一个强密码，再执行：
+
+```bash
+cd ~/AVProject/AVServer
+sudo mysql < sql/000_create_database.sql.example
+mysql -u avapp -p avproject < sql/001_init_auth_media.sql
+cp config/db.conf.example config/db.conf
+chmod 600 config/db.conf
+```
+
+编辑 `config/db.conf`，写入刚才的应用密码。AVServer 只连接 `127.0.0.1:3306`，不使用 root；示例账号只拥有 `avproject` 上的 SELECT、INSERT、UPDATE 权限。真实 `db.conf` 已由 `.gitignore` 排除。
+
+确认表：
+
+```bash
+mysql -u avapp -p avproject -e "SHOW TABLES; DESCRIBE users; DESCRIBE media;"
+```
 
 ## 8. Ubuntu 服务端构建
 
@@ -221,6 +243,9 @@ AVServer/include/ConnectionContext.h
 AVServer/include/EpollServer.h
 AVServer/include/ThreadPool.h
 AVServer/include/ProtocolDispatcher.h
+AVServer/include/DatabaseConnectionPool.h
+AVServer/include/AuthService.h
+AVServer/include/MediaRepository.h
 AVServer/include/MediaManager.h
 AVServer/include/UploadManager.h
 AVServer/include/DownloadManager.h
@@ -229,10 +254,14 @@ AVServer/src/ConnectionContext.cpp
 AVServer/src/EpollServer.cpp
 AVServer/src/ThreadPool.cpp
 AVServer/src/ProtocolDispatcher.cpp
+AVServer/src/DatabaseConnectionPool.cpp
+AVServer/src/AuthService.cpp
+AVServer/src/MediaRepository.cpp
 AVServer/src/MediaManager.cpp
 AVServer/src/UploadManager.cpp
 AVServer/src/DownloadManager.cpp
 AVServer/Makefile
+AVServer/config/db.conf
 ```
 
 然后执行：
@@ -261,9 +290,10 @@ AVServer/AVServer
 ./AVServer
 ```
 
-阶段 10 启动后应看到类似日志：
+阶段 11 启动后应看到类似日志：
 
 ```text
+database pool connected host=127.0.0.1 port=3306 database=avproject size=4
 media directory: media
 upload temp directory: temp
 upload task directory: temp/tasks
@@ -277,7 +307,7 @@ non-core idle timeout=60s
 listening on port 8000
 ```
 
-`Makefile` 使用 `-pthread` 并编译 `ThreadPool.cpp`。客户端连接、任务提交和完成日志会同时包含 `fd=...`、`connectionId=...` 与协议类型，用于区分多个并发连接。若存在未完成上传任务，启动日志还会显示恢复的 transfer ID；不会打印完整 resume token。
+`Makefile` 使用 `-pthread`、`mysql_config --cflags/--libs` 和 `-lsodium`。客户端连接、任务提交和完成日志会同时包含 `fd=...`、`connectionId=...` 与协议类型。若存在未完成上传任务，日志会显示 transfer ID，但不会打印完整 resume token、密码、password hash 或数据库密码。
 
 ## 9. 服务端运行目录
 
@@ -286,18 +316,21 @@ listening on port 8000
 ```text
 AVServer/
 ├── AVServer             # Linux 可执行文件
+├── config/db.conf       # 本机数据库凭据，不提交
 ├── media/               # 正式远程媒体
 └── temp/
     ├── *.part            # 上传中的文件数据
     └── tasks/*.task      # 可恢复任务元数据
 ```
 
-- `media/`：启动时自动创建，媒体列表只扫描这里。
+- `media/`：启动时自动创建，只保存文件本体；媒体业务列表来自 MySQL `media` 表。
 - `temp/`：启动时自动创建，上传未完成文件和任务元数据保存在这里。
 - `temp/tasks/`：小型键值任务文件；不要手工修改 token、offset 或路径。
 - `cache/`：属于 Windows 客户端，不在服务端。
 
 如果从其他目录执行绝对路径，`media/` 和 `temp/` 会创建在当前 shell 工作目录，而不是可执行文件旁边。
+
+同理，`config/db.conf` 是相对路径，因此必须从 `AVServer/` 启动。配置缺失或数据库初始连接失败时，程序打印明确错误并退出。
 
 ## 10. 查看 IP 地址
 
@@ -357,17 +390,24 @@ Test-NetConnection 192.168.44.130 -Port 8000
 
 ## 12. 自动化测试工具
 
-`tools/concurrent_client_test.py` 只使用 Python 标准库。它会建立多个同步起跑的连接，每个连接重复发送 Ping，也可额外校验媒体列表：
+阶段 11 认证与媒体列表烟测只使用 Python 标准库：
 
 ```bash
 cd ~/AVProject
-python3 tools/concurrent_client_test.py 192.168.44.130 8000 5
-python3 tools/concurrent_client_test.py 192.168.44.130 8000 5 --pings 10 --media-list
+python3 tools/auth_media_test.py --host 127.0.0.1 --port 8000
 ```
 
-输出应显示每个 client 成功以及汇总中的 `failed=0`。当前长度头和结构体整数沿用主机小端格式，因此测试机与服务端应保持当前 x86/x86-64 小端环境。
+脚本生成临时 userA/userB，验证未登录列表、重复注册、错误密码、SQL 注入式用户名、正确登录，以及 PUBLIC/MINE 基础查询。它不连接 MySQL，也不会打印生成的密码。当前长度头和结构体整数沿用主机小端格式，因此测试机与服务端应保持当前 x86/x86-64 小端环境。
 
-上传断点续传工具同样只使用 Python 标准库：
+并发 Ping 仍可使用：
+
+```bash
+python3 tools/concurrent_client_test.py 192.168.44.130 8000 5 --pings 10
+```
+
+阶段 11 后媒体业务要求先登录并且下载按 mediaId 请求。阶段 8/9 的独立续传脚本和阶段 10 的媒体并发参数保留为历史协议测试参考，不应直接对阶段 11 服务端运行；当前上传/下载续传和线程池媒体并发请通过两个已登录 AVClient 做人工回归。
+
+阶段 8 上传断点续传脚本历史命令：
 
 ```bash
 cd ~/AVProject
@@ -382,7 +422,7 @@ python3 tools/resumable_upload_test.py 127.0.0.1 8000 \
   --server-media-dir ./AVServer/media
 ```
 
-下载断点续传工具使用指定的远程媒体文件：
+阶段 9 下载断点续传脚本历史命令：
 
 ```bash
 cd ~/AVProject
@@ -392,7 +432,7 @@ python3 tools/resumable_download_test.py 192.168.44.130 8000 test.mp4 \
 
 它会下载若干 64 KB 分片后主动断线，把 `.part` 和 JSON 状态写入输出目录，再以非零 offset 重连并完成下载。脚本验证 accepted offset 和最终文件大小，不播放文件。下载恢复不需要服务端任务目录；AVServer 仅重新检查远程文件大小、修改时间和请求偏移。
 
-阶段 10 业务线程池并发测试：
+阶段 10 业务线程池并发脚本历史命令：
 
 ```bash
 cd ~/AVProject
@@ -410,7 +450,7 @@ python3 tools/thread_pool_concurrency_test.py \
   --download-file test.mp4 --download-blocks 4
 ```
 
-启动时应有 4 个核心 worker。任务明显积压时观察 `thread pool expanded`，线程总数不得超过 8；任务结束并空闲约 60 秒后，应看到非核心 worker 因 `idle_timeout` 退出并恢复到 4 个。正式业务代码没有为测试加入 `sleep`。
+这些历史脚本中的媒体包仍是对应阶段的旧结构。阶段 11 的当前验证以 `auth_media_test.py` 和两个已登录 AVClient 为准。启动时应有 4 个核心 worker；任务明显积压时观察 `thread pool expanded`，线程总数不得超过 8；任务结束并空闲约 60 秒后，应看到非核心 worker 因 `idle_timeout` 退出并恢复到 4 个。
 
 ## 13. 推荐启动顺序
 
@@ -421,7 +461,8 @@ python3 tools/thread_pool_concurrency_test.py \
 5. Settings 页输入 IP 和端口。
 6. Connect。
 7. Send Ping。
-8. Remote Media 页刷新列表。
+8. Account 页 Register 后 Login。
+9. Remote Media 页分别刷新 Public media 和 My media。
 
 ## 14. 常见构建问题
 
@@ -480,14 +521,15 @@ make
 
 ### 14.5 服务端列表为空
 
-确认从正确工作目录启动，并检查：
+阶段 11 列表来自数据库。先确认登录成功，再检查：
 
 ```bash
 pwd
 ls -lah media
+mysql -u avapp -p avproject -e "SELECT id,owner_user_id,original_name,stored_name,status FROM media;"
 ```
 
-文件后缀应处于支持白名单。
+磁盘中存在但没有 `media` 记录的历史文件不会显示，这是避免错误归属的预期行为。
 
 ### 14.6 服务端目录无权限
 
@@ -496,3 +538,24 @@ ls -ld . media temp
 ```
 
 运行用户需要对项目运行目录具有读写和重命名权限。
+
+### 14.7 数据库配置或连接失败
+
+若出现 `database config not found`，确认当前目录是 `AVServer/` 且存在权限为 600 的 `config/db.conf`。若出现 `cannot connect to MySQL`，依次检查：
+
+```bash
+sudo systemctl status mysql
+ss -lntp | grep 3306
+mysql -h 127.0.0.1 -u avapp -p avproject -e "SELECT 1;"
+```
+
+应用密码、用户 host 和数据库名必须与初始化脚本一致。MySQL 不需要对外网开放 3306。
+
+### 14.8 链接阶段找不到 MySQL 或 libsodium
+
+```bash
+sudo apt install default-libmysqlclient-dev libsodium-dev
+mysql_config --cflags --libs
+ldconfig -p | grep sodium
+make clean && make
+```
