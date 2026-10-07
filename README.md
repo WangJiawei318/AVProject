@@ -2,17 +2,11 @@
 
 ## 项目简介
 
-AVProject 是一个面向音视频学习与工程整合的 C++ 客户端/服务端项目。
+AVProject 是一个面向音视频学习的 C++ 客户端/服务端项目。
 
 - Windows 客户端负责本地音视频播放、桌面录制、用户注册登录、远程媒体管理、分片上传、分片下载和下载后播放。
 - Ubuntu 服务端负责 TCP 通信、用户认证、媒体归属、MySQL 元数据、上传临时文件管理和媒体文件分块读取。
 
-项目从四个独立学习工程逐步整合而来，并保留原项目作为参考：
-
-- `MediaPlayer`：Qt + FFmpeg + SDL + OpenGL 播放器。
-- `VideoRecorder`：Qt + FFmpeg + OpenCV 录屏器。
-- `NetDisk-Client`：Windows TCP 客户端封装参考。
-- `NetDisk-Server`：Linux epoll、线程池和协议分发参考。
 
 当前主线工程是 `AVClient` 和 `AVServer`。现阶段已经形成：
 
@@ -75,7 +69,7 @@ AVProject 是一个面向音视频学习与工程整合的 C++ 客户端/服务�
 - 多个同名原始文件使用不同 `stored_name`，不会争用磁盘文件名。
 - 连接断开时只解除上传任务的当前会话绑定，保留可恢复任务和 `.part` 文件。
 
-> 当前 `AVServer` 使用 epoll LT 单线程 Reactor + 有界动态业务线程池。Reactor 独占网络 I/O、连接、认证状态和发送队列；worker 处理 MySQL、Argon2id、文件读写和上传元数据。线程池能隔离同步业务阻塞，但当前仍有粗粒度上传锁、同步磁盘 I/O 和简单扩缩容策略，不等同于生产级高并发媒体服务器。
+> 当前 `AVServer` 使用 epoll LT 单线程 Reactor + 有界动态业务线程池。Reactor 独占网络 I/O、连接、认证状态和发送队列；worker 处理 MySQL、Argon2id、文件读写和上传元数据。
 
 ## 技术栈
 
@@ -140,7 +134,7 @@ AVServer (Ubuntu)
 | 阶段 3 | 远程媒体列表 | 完成 |
 | 阶段 4 | 64 KB 分片上传 | 完成 |
 | 阶段 5 | 64 KB 分片下载与下载后播放 | 完成 |
-| 阶段 6 | 工程文档、架构说明与面试复盘 | 完成 |
+| 阶段 6 | 工程文档、架构说明与复盘 | 完成 |
 | 阶段 7 | epoll LT 单线程 Reactor 与多客户端并发 | 完成 |
 | 阶段 8 | 上传断点续传与客户端/服务端任务恢复 | 完成 |
 | 阶段 9 | 下载断点续传与客户端任务恢复 | 完成 |
@@ -233,11 +227,9 @@ D:\Software\Qt\Tools\mingw730_32\bin\mingw32-make.exe -j4
 - [通信协议设计](docs/PROTOCOL_DESIGN.md)
 - [构建与运行](docs/BUILD_AND_RUN.md)
 - [完整测试流程](docs/TEST_WORKFLOW.md)
-- [面试问答复盘](docs/INTERVIEW_QA.md)
 - [阶段 7：epoll 多客户端改造](docs/stage_logs/STAGE7_EPOLL_MULTI_CLIENT.md)
 - [阶段 8：上传断点续传与任务恢复](docs/stage_logs/STAGE8_RESUMABLE_UPLOAD.md)
 - [阶段 9：下载断点续传与客户端任务恢复](docs/stage_logs/STAGE9_RESUMABLE_DOWNLOAD.md)
 - [阶段 10：有界动态业务线程池](docs/stage_logs/STAGE10_DYNAMIC_THREAD_POOL.md)
 - [阶段 11：MySQL 用户认证与媒体归属](docs/stage_logs/STAGE11_MYSQL_AUTH_MEDIA_OWNERSHIP.md)
 
-> 阶段 11 启用数据库媒体索引后，`AVServer/media/` 中没有对应 `media` 记录的历史文件属于 legacy media，不会出现在新列表中，也不会自动分配给任何用户。上传任务仍使用 `temp/tasks/*.task` 文件持久化，没有迁移到 MySQL。
